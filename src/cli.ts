@@ -3,12 +3,15 @@ import { Command, Option } from "commander";
 import { existsSync, readFileSync, copyFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { query } from "@anthropic-ai/claude-agent-sdk";
 import { makeGuard, readLockedFiles, lockedMatch } from "./guard.js";
 import { gate, redact } from "./report.js";
 import { takeSnapshot, diffSnapshots, describeChanges } from "./snapshot.js";
 import { resolveReportPath, writeReportFile, latestReportPath, UnsafePathError } from "./paths.js";
 import { buildTeam, LEAD_ADDENDUM } from "./team.js";
+import { collectFacts } from "./offline/facts.js";
+import { runRules } from "./offline/rules.js";
+import { renderReport } from "./offline/render.js";
+import { detectLocalModel, isLocalUrl, localDiagnosis } from "./llm.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SYSTEM_PROMPT = readFileSync(path.join(ROOT, "prompts", "guardian.md"), "utf8");
@@ -27,7 +30,14 @@ interface RunOptions {
   quiet: boolean;
   team: boolean;
   lang?: string;
+  engine: Engine;
+  llmUrl?: string;
+  localModel?: string;
+  allowRemoteLlm: boolean;
+  note?: string;
 }
+
+export type Engine = "auto" | "offline" | "local" | "claude";
 
 const dim = (s: string) => (process.stderr.isTTY ? `\x1b[2m${s}\x1b[0m` : s);
 const log = (s: string) => process.stderr.write(dim(`  ${s}`) + "\n");
@@ -95,10 +105,17 @@ async function run(mode: Mode, o: RunOptions, extra?: string, previousReport?: s
     if (err instanceof UnsafePathError) { console.error(err.message); return 2; }
     throw err;
   }
+  // Free engines: no account, no API key. Claude is used only when asked for, or in auto mode when a key is set.
+  if (mode !== "fix" && (o.engine === "offline" || o.engine === "local" || (o.engine === "auto" && !hasCredentials()))) {
+    return runFree(mode, o, outPath);
+  }
   if (!hasCredentials()) {
-    console.error("Set ANTHROPIC_API_KEY first. Get a key at https://console.anthropic.com");
+    console.error(mode === "fix"
+      ? "`unstuck fix` edits code with Claude and needs ANTHROPIC_API_KEY. The free engines only diagnose."
+      : "The Claude engine needs ANTHROPIC_API_KEY. Use --engine offline or --engine local for the free engines.");
     return 2;
   }
+  const { query } = await import("@anthropic-ai/claude-agent-sdk");
 
   const writes = mode === "fix";
   const team = o.team && !writes;
@@ -182,9 +199,57 @@ async function run(mode: Mode, o: RunOptions, extra?: string, previousReport?: s
   return gate(report, o.failOn, warn);
 }
 
+async function runFree(mode: Mode, o: RunOptions, outPath: string): Promise<number> {
+  if (o.llmUrl && !isLocalUrl(o.llmUrl) && !o.allowRemoteLlm) {
+    console.error(`Refusing to send project details to ${o.llmUrl}: it isn't on this computer. Add --allow-remote-llm if you trust that server.`);
+    return 2;
+  }
+  const facts = collectFacts(o.repo);
+  const findings = runRules(facts);
+  let report: string;
+  let engineLabel = "offline (free, no AI)";
+  if (o.engine === "offline") {
+    report = renderReport(facts, findings, o.note);
+  } else {
+    const m = await detectLocalModel({ url: o.llmUrl, model: o.localModel });
+    if (!m) {
+      const hint = o.localModel
+        ? `Model "${o.localModel}" not found on ${o.llmUrl ?? "Ollama (localhost:11434) or LM Studio (localhost:1234)"}.`
+        : `No local model server found${o.llmUrl ? ` at ${o.llmUrl}` : " (looked for Ollama on localhost:11434 and LM Studio on localhost:1234)"}.`;
+      if (o.engine === "local") {
+        console.error(`${hint}\nInstall Ollama from https://ollama.com, run \`ollama pull qwen2.5-coder:7b\`, then try again. Or use --engine offline.`);
+        return 2;
+      }
+      if (!o.quiet) log(`${hint} Using the free offline engine. For a deeper diagnosis, install Ollama and run \`ollama pull qwen2.5-coder:7b\`.`);
+      report = renderReport(facts, findings, o.note);
+    } else {
+      process.stderr.write(`🛟 UNSTUCK ${VERSION} · ${mode} · engine: local model ${m.model} · ${o.repo}\n`);
+      const r = await localDiagnosis(m, facts, findings, o.note, o.lang, o.quiet ? undefined : log);
+      report = r.report;
+      engineLabel = r.usedModel ? `local model ${m.model}` : "offline (local model answer not usable)";
+    }
+  }
+  if (engineLabel.startsWith("offline")) {
+    process.stderr.write(`🛟 UNSTUCK ${VERSION} · ${mode} · engine: ${engineLabel} · ${o.repo}\n`);
+    if (o.lang) warn("The offline engine writes in English only; --lang needs a local model or Claude.");
+    if (mode === "review" && o.base) warn("The free engines diagnose the whole project; --base is used by the Claude engine only.");
+  }
+  try {
+    writeReportFile(outPath, report + "\n", o.repo);
+    if (!o.out) writeReportFile(latestReportPath(o.repo), report + "\n", o.repo);
+  } catch (err) {
+    console.error(`Could not save the report: ${(err as Error).message}`);
+    process.stdout.write("\n" + report + "\n");
+    return 1;
+  }
+  process.stdout.write("\n" + report + "\n");
+  process.stderr.write(`\nReport saved to ${outPath} · cost: $0\n`);
+  return gate(report, o.failOn, warn);
+}
+
 const program = new Command()
   .name("unstuck")
-  .description("An AI agent team that reviews, tests, risk-checks and rescues code — especially code built with AI tools.")
+  .description("Diagnoses stuck projects, especially ones built with AI tools. Works free and offline; optionally uses a local open-source model or Claude.")
   .version(VERSION);
 
 const common = (c: Command, defaultTeam: boolean) =>
@@ -192,6 +257,11 @@ const common = (c: Command, defaultTeam: boolean) =>
     .argument("[path]", "project folder", ".")
     .option("-o, --out <file>", "where to save the report (must be outside the project; default ~/.unstuck/reports/…)")
     .option("--run-checks", "allow running the project's tests, build and lint (they can execute code and write files)")
+    .addOption(new Option("-e, --engine <engine>", "auto: Claude if ANTHROPIC_API_KEY is set, else a local model if running, else offline").choices(["auto", "offline", "local", "claude"]).default("auto"))
+    .option("--note <text>", "what feels stuck, in your words")
+    .option("--local-model <name>", "local model to use, e.g. qwen2.5-coder:7b (default: best installed)")
+    .option("--llm-url <url>", "local model server, e.g. http://localhost:11434 (Ollama) or http://localhost:1234 (LM Studio)")
+    .option("--allow-remote-llm", "allow --llm-url to point at another computer (project details will be sent there)")
     .option("-m, --model <model>", "Claude model to use, e.g. opus or sonnet")
     .option("--max-turns <n>", "maximum agent steps", "100")
     .option("--fail-on <level>", "exit with code 1 if findings at this severity or worse exist (P0, P1, P2, P3)")
@@ -211,6 +281,11 @@ const opts = (p: string, c: Record<string, string | boolean | undefined>, defaul
   quiet: Boolean(c.quiet),
   team: c.team ? true : c.solo ? false : defaultTeam,
   lang: c.lang as string | undefined,
+  engine: ((c.engine as string) || "auto") as Engine,
+  llmUrl: c.llmUrl as string | undefined,
+  localModel: c.localModel as string | undefined,
+  allowRemoteLlm: Boolean(c.allowRemoteLlm),
+  note: c.note as string | undefined,
 });
 
 const done = (code: number) => { process.exitCode = code; };

@@ -6,7 +6,7 @@ branding:
   color: "purple"
 inputs:
   anthropic-api-key:
-    description: "Anthropic API key (store it as a repository secret)"
+    description: "Anthropic API key (optional; without it the free offline engine runs)"
     required: false
   mode:
     description: "review, audit or rescue"
@@ -48,11 +48,12 @@ runs:
       env:
         KEY: ${{ inputs.anthropic-api-key }}
       run: |
+        echo "skip=false" >> "$GITHUB_OUTPUT"
         if [ -z "$KEY" ]; then
-          echo "::notice title=UNSTUCK skipped::No ANTHROPIC_API_KEY available (pull requests from forks don't get secrets). Skipping the review."
-          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "::notice title=UNSTUCK free engine::No ANTHROPIC_API_KEY (pull requests from forks don't get secrets). Running the free offline engine."
+          echo "engine=offline" >> "$GITHUB_OUTPUT"
         else
-          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "engine=claude" >> "$GITHUB_OUTPUT"
         fi
     - uses: actions/setup-node@v5
       if: steps.key.outputs.skip == 'false'
@@ -76,13 +77,14 @@ runs:
         IN_LANG: ${{ inputs.lang }}
         IN_TURNS: ${{ inputs.max-turns }}
         IN_CHECKS: ${{ inputs.run-checks }}
+        IN_ENGINE: ${{ steps.key.outputs.engine }}
       run: |
         set +e
         # The report is written outside the checked-out project.
         REPORT="$RUNNER_TEMP/unstuck-report.md"
         rm -f "$REPORT"
         case "$IN_MODE" in review|audit|rescue) ;; *) echo "::error::mode must be review, audit or rescue"; exit 1;; esac
-        ARGS=("$IN_MODE" "." --out "$REPORT" --max-turns "$IN_TURNS" --quiet)
+        ARGS=("$IN_MODE" "." --out "$REPORT" --engine "$IN_ENGINE" --max-turns "$IN_TURNS" --quiet)
         if [ "$IN_MODE" = "review" ] && [ -n "$BASE_REF" ]; then
           git fetch --no-tags --depth=500 origin "$BASE_REF" >/dev/null 2>&1
           ARGS+=(--base "origin/$BASE_REF")

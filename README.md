@@ -1,18 +1,50 @@
 # 🛟 UNSTUCK
 
-**An AI agent team that gets AI-built code unstuck.**
+**Gets AI-built code unstuck. Free, offline, no account needed.**
 
 You built something fast with Lovable, Cursor, Bolt, v0 or Claude Code. Now every fix breaks something else, nobody knows if it's safe to ship, and the AI keeps undoing its own work.
 
-UNSTUCK puts a senior team on your project — a code reviewer, a refactor architect, a QA lead, a risk & compliance officer and a product challenger — led by an agent that checks their work. You get one report, in plain language: what's wrong, what to fix first, and what to stop doing.
+UNSTUCK reads your project and its git history and tells you, in plain language: what the project is meant to do, what state it's really in, which problems are **proven** and which are only **suspected**, and the **one next move** to make.
 
 ```bash
 npx unstuck rescue
 ```
 
+No API key, no subscription, nothing leaves your computer.
+
 ---
 
-## The team
+## Three engines, one report
+
+| Engine | Cost | Needs | What you get |
+|--------|------|-------|--------------|
+| **Offline** (always available) | Free | Nothing | Rule-based checks of your files and git history: fix/revert loops, competing "v2" copies, missing tests, leaked secrets, packages that aren't installed, instructions planted for AI tools, and more. |
+| **Local open-source model** | Free | [Ollama](https://ollama.com) or [LM Studio](https://lmstudio.ai), ~8–16 GB RAM | The offline checks, plus an open model (Qwen Coder, Llama, DeepSeek, Gemma…) running on your computer reads the evidence and the key code and writes a sharper diagnosis. |
+| **Claude** (optional) | Pay per use | `ANTHROPIC_API_KEY` | The full five-specialist team described below, which can also run your tests and apply fixes. |
+
+UNSTUCK picks automatically: Claude if you've set a key, otherwise a local model if one is running, otherwise offline. Force one with `--engine offline|local|claude`.
+
+### Use a free local model
+
+```bash
+# 1. Install Ollama from https://ollama.com, then download a coding model once (~4.7 GB):
+ollama pull qwen2.5-coder:7b
+# 2. Run UNSTUCK as usual — it finds the model automatically:
+npx unstuck rescue --note "totals in INR look wrong"
+```
+
+Smaller computers: `ollama pull qwen2.5-coder:3b` (~2 GB). Choose a model with `--local-model <name>`; point at LM Studio or another server with `--llm-url http://localhost:1234`.
+
+How the local model is kept honest:
+- It gets **no tools**. It can't run commands or touch files; it only sees facts and code excerpts that UNSTUCK's own code collected (secrets are scrubbed first).
+- Its answer is **checked**: all six sections must be there, and every `file:line` it cites must exist. If not, you get the offline report instead.
+- The proven/suspected split and the pass/fail summary always come from the rule-based checks, not the model.
+- UNSTUCK refuses to send anything to a model server on another computer unless you add `--allow-remote-llm`.
+
+## The Claude team (optional)
+
+With an `ANTHROPIC_API_KEY`, `review`, `audit`, `rescue` and `fix` run a team of Claude agents:
+
 
 | Specialist | What they do |
 |------------|--------------|
@@ -118,24 +150,20 @@ jobs:
           # run-checks: true # run your tests/build (runs PR code with the key in the environment)
 ```
 
-UNSTUCK writes its report outside the checkout, posts it as a PR comment (updating the same comment on each push), adds it to the job summary, uploads it as an artifact, and fails the check if it finds a P0. Pull requests from forks don't get your secret, so they're skipped with a notice.
+UNSTUCK writes its report outside the checkout, posts it as a PR comment (updating the same comment on each push), adds it to the job summary, uploads it as an artifact, and fails the check if it finds a P0. Without `anthropic-api-key` (including pull requests from forks, which don't get secrets) it runs the free offline engine instead.
 
 > **Security:** use the `pull_request` trigger as shown. Don't use `pull_request_target` — it would run an AI agent with your API key on code from strangers.
 
 ## Setup
 
 1. Node.js 18 or newer.
-2. An Anthropic API key from [console.anthropic.com](https://console.anthropic.com):
+2. In your project folder:
    ```bash
-   export ANTHROPIC_API_KEY=sk-ant-...
+   npx unstuck rescue
    ```
-   (Amazon Bedrock and Google Vertex work too, via Claude Code's usual environment variables.)
-3. In your project folder:
-   ```bash
-   npx unstuck review
-   ```
-
-The cost is printed at the end of each run. A solo review of a small change is usually cents; a full team audit of a large project costs more. Use `--model sonnet` for cheaper runs.
+   That's it: the free offline engine needs nothing else.
+3. Optional, free: install [Ollama](https://ollama.com) and `ollama pull qwen2.5-coder:7b` for the local-model engine.
+4. Optional, paid: `export ANTHROPIC_API_KEY=sk-ant-...` for the Claude team (Amazon Bedrock and Google Vertex work too, via Claude Code's usual environment variables). Its cost is printed after each run; use `--model sonnet` for cheaper runs.
 
 ## Prefer Claude Code?
 

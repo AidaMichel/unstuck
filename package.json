@@ -1,7 +1,7 @@
 {
   "name": "unstuck",
   "version": "0.1.0",
-  "description": "An AI agent team that reviews, tests, risk-checks and rescues code — especially code built with AI tools.",
+  "description": "Diagnoses stuck projects, especially AI-built ones. Free and offline; optionally uses a local open-source model (Ollama, LM Studio) or Claude.",
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
@@ -23,7 +23,12 @@
     "multi-agent",
     "audit",
     "rescue",
-    "github-action"
+    "github-action",
+    "offline",
+    "ollama",
+    "local-llm",
+    "open-source-model",
+    "lm-studio"
   ],
   "author": "Aida Michel",
   "license": "MIT",

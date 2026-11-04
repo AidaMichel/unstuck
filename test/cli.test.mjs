@@ -35,10 +35,19 @@ for (const mode of ["review", "audit", "rescue"]) {
   });
 }
 
-test("default run without a key exits cleanly and leaves the project untouched", () => {
-  const repo = project();
+test("default run without a key uses the free engine and leaves the project untouched", () => {
+  const repo = project(), reports = tmp();
   const before = takeSnapshot(repo);
-  const r = run(["audit", repo]);
+  const r = run(["audit", repo, "--llm-url", "http://127.0.0.1:9"], { UNSTUCK_REPORT_DIR: reports });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /engine: offline/);
+  assert.equal(totalChanges(diffSnapshots(before, takeSnapshot(repo))), 0);
+});
+
+test("--engine claude without a key exits cleanly with a clear message and leaves the project untouched", () => {
+  const repo = project(), reports = tmp();
+  const before = takeSnapshot(repo);
+  const r = run(["audit", repo, "--engine", "claude"], { UNSTUCK_REPORT_DIR: reports });
   assert.equal(r.status, 2);
   assert.match(r.stderr, /ANTHROPIC_API_KEY/);
   assert.equal(totalChanges(diffSnapshots(before, takeSnapshot(repo))), 0);
