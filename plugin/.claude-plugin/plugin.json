@@ -1,0 +1,8 @@
+{
+  "name": "unstuck",
+  "version": "0.1.0",
+  "description": "Read-only rescue diagnosis for stuck projects, especially ones built with AI tools: goal, reality, evidence, verified problems, hypotheses, and one next move.",
+  "author": {
+    "name": "Aida Michel"
+  }
+}
