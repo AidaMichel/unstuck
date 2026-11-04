@@ -1,7 +1,7 @@
 {
   "name": "unstuck",
   "version": "0.1.0",
-  "description": "An AI agent that reviews, tests, risk-checks and rescues code — especially code built with AI tools.",
+  "description": "An AI agent team that reviews, tests, risk-checks and rescues code — especially code built with AI tools.",
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
@@ -19,7 +19,11 @@
     "claude",
     "vibe-coding",
     "lovable",
-    "cursor"
+    "cursor",
+    "multi-agent",
+    "audit",
+    "rescue",
+    "github-action"
   ],
   "author": "Aida Michel",
   "license": "MIT",
@@ -40,7 +44,8 @@
     "prompts",
     "templates",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "agents"
   ],
   "engines": {
     "node": ">=18"

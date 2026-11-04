@@ -1,8 +1,8 @@
 # Copy to .github/workflows/unstuck.yml in your project.
-# Add your key: Settings → Secrets and variables → Actions → New secret → ANTHROPIC_API_KEY
+# Add your key: Settings → Secrets and variables → Actions → New repository secret → ANTHROPIC_API_KEY
 name: UNSTUCK review
 on:
-  pull_request:
+  pull_request:   # keep this trigger; never use pull_request_target with UNSTUCK
 permissions:
   contents: read
   pull-requests: write
@@ -16,4 +16,6 @@ jobs:
       - uses: AidaMichel/unstuck@v0
         with:
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
-          fail-on: P0   # block merging when a P0 (security, data, money, trust) issue is found
+          fail-on: P0     # block merging when a P0 (security, data, money, trust) issue is found
+          # team: true    # full five-specialist team (deeper, costs more)
+          # lang: Arabic  # write the report in another language

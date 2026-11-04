@@ -1,5 +1,5 @@
 name: "UNSTUCK review"
-description: "AI review of every pull request: code, refactor plan, QA, risk & compliance, and a challenge pass."
+description: "An AI agent team reviews every pull request: code, refactor plan, QA, risk & compliance, and a challenge pass."
 author: "Aida Michel"
 branding:
   icon: "shield"
@@ -7,65 +7,115 @@ branding:
 inputs:
   anthropic-api-key:
     description: "Anthropic API key (store it as a repository secret)"
-    required: true
+    required: false
   mode:
     description: "review, audit or rescue"
     default: "review"
   fail-on:
-    description: "Fail the check if findings at this severity or worse exist (P0, P1, P2). Empty = never fail."
+    description: "Fail the check if findings at this severity or worse exist (P0, P1, P2, P3). Empty = never fail."
     default: "P0"
+  team:
+    description: "Use the five-specialist team (deeper, slower, costs more)"
+    default: "false"
   model:
     description: "Claude model to use (optional)"
     default: ""
+  lang:
+    description: "Write the report in this language, e.g. Arabic (optional)"
+    default: ""
   max-turns:
     description: "Maximum agent steps"
-    default: "80"
+    default: "100"
   comment:
-    description: "Post the report as a pull request comment"
+    description: "Post the report as a pull request comment (updated on every push)"
     default: "true"
 outputs:
   report-path:
     description: "Path to the report file"
     value: ${{ steps.run.outputs.report }}
+  exit-code:
+    description: "0 = passed the severity gate, 1 = failed it or the run failed"
+    value: ${{ steps.run.outputs.code }}
 runs:
   using: "composite"
   steps:
+    - name: Check for API key
+      id: key
+      shell: bash
+      env:
+        KEY: ${{ inputs.anthropic-api-key }}
+      run: |
+        if [ -z "$KEY" ]; then
+          echo "::notice title=UNSTUCK skipped::No ANTHROPIC_API_KEY available (pull requests from forks don't get secrets). Skipping the review."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        fi
     - uses: actions/setup-node@v4
+      if: steps.key.outputs.skip == 'false'
       with:
         node-version: "20"
     - name: Install UNSTUCK
+      if: steps.key.outputs.skip == 'false'
       shell: bash
-      run: cd "${{ github.action_path }}" && npm ci --no-audit --no-fund && npm run build
+      run: cd "$GITHUB_ACTION_PATH" && npm ci --no-audit --no-fund --loglevel=error && npm run build --silent
     - name: Run UNSTUCK
       id: run
+      if: steps.key.outputs.skip == 'false'
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
         BASE_REF: ${{ github.base_ref }}
+        IN_MODE: ${{ inputs.mode }}
+        IN_FAIL: ${{ inputs.fail-on }}
+        IN_TEAM: ${{ inputs.team }}
+        IN_MODEL: ${{ inputs.model }}
+        IN_LANG: ${{ inputs.lang }}
+        IN_TURNS: ${{ inputs.max-turns }}
       run: |
         set +e
-        ARGS=("${{ inputs.mode }}" "." --out unstuck-report.md --max-turns "${{ inputs.max-turns }}" --quiet)
-        if [ "${{ inputs.mode }}" = "review" ] && [ -n "$BASE_REF" ]; then
-          git fetch --no-tags --depth=200 origin "$BASE_REF"
+        case "$IN_MODE" in review|audit|rescue) ;; *) echo "::error::mode must be review, audit or rescue"; exit 1;; esac
+        ARGS=("$IN_MODE" "." --out unstuck-report.md --max-turns "$IN_TURNS" --quiet)
+        if [ "$IN_MODE" = "review" ] && [ -n "$BASE_REF" ]; then
+          git fetch --no-tags --depth=500 origin "$BASE_REF" >/dev/null 2>&1
           ARGS+=(--base "origin/$BASE_REF")
         fi
-        [ -n "${{ inputs.fail-on }}" ] && ARGS+=(--fail-on "${{ inputs.fail-on }}")
-        [ -n "${{ inputs.model }}" ] && ARGS+=(--model "${{ inputs.model }}")
-        node "${{ github.action_path }}/dist/cli.js" "${ARGS[@]}" > /dev/null
+        [ -n "$IN_FAIL" ] && ARGS+=(--fail-on "$IN_FAIL")
+        [ -n "$IN_MODEL" ] && ARGS+=(--model "$IN_MODEL")
+        [ -n "$IN_LANG" ] && ARGS+=(--lang "$IN_LANG")
+        if [ "$IN_TEAM" = "true" ]; then ARGS+=(--team); else ARGS+=(--solo); fi
+        node "$GITHUB_ACTION_PATH/dist/cli.js" "${ARGS[@]}" > /dev/null
         CODE=$?
         echo "report=unstuck-report.md" >> "$GITHUB_OUTPUT"
         echo "code=$CODE" >> "$GITHUB_OUTPUT"
-        [ -f unstuck-report.md ] && cat unstuck-report.md >> "$GITHUB_STEP_SUMMARY"
+        if [ -f unstuck-report.md ]; then
+          head -c 900000 unstuck-report.md >> "$GITHUB_STEP_SUMMARY"
+        fi
         exit 0
+    - name: Upload report
+      if: steps.key.outputs.skip == 'false' && hashFiles('unstuck-report.md') != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: unstuck-report
+        path: unstuck-report.md
     - name: Comment on pull request
-      if: inputs.comment == 'true' && github.event_name == 'pull_request' && hashFiles('unstuck-report.md') != ''
+      if: steps.key.outputs.skip == 'false' && inputs.comment == 'true' && github.event_name == 'pull_request' && hashFiles('unstuck-report.md') != ''
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         PR: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
       run: |
-        { echo "## 🛟 UNSTUCK review"; echo; cat unstuck-report.md; } > unstuck-comment.md
-        gh pr comment "$PR" --body-file unstuck-comment.md --edit-last 2>/dev/null || gh pr comment "$PR" --body-file unstuck-comment.md
+        node "$GITHUB_ACTION_PATH/dist/comment.js" unstuck-report.md unstuck-comment.md
+        ID=$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq '.[] | select(.body | startswith("<!-- unstuck:comment -->")) | .id' 2>/dev/null | tail -1)
+        if [ -n "$ID" ]; then
+          gh api -X PATCH "repos/$REPO/issues/comments/$ID" -F body=@unstuck-comment.md >/dev/null
+        else
+          gh pr comment "$PR" --repo "$REPO" --body-file unstuck-comment.md
+        fi
     - name: Apply severity gate
+      if: steps.key.outputs.skip == 'false'
       shell: bash
-      run: exit ${{ steps.run.outputs.code }}
+      env:
+        CODE: ${{ steps.run.outputs.code }}
+      run: exit "${CODE:-1}"
