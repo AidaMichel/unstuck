@@ -51,10 +51,10 @@ runs:
         else
           echo "skip=false" >> "$GITHUB_OUTPUT"
         fi
-    - uses: actions/setup-node@v4
+    - uses: actions/setup-node@v5
       if: steps.key.outputs.skip == 'false'
       with:
-        node-version: "20"
+        node-version: "22"
     - name: Install UNSTUCK
       if: steps.key.outputs.skip == 'false'
       shell: bash
@@ -94,7 +94,7 @@ runs:
         exit 0
     - name: Upload report
       if: steps.key.outputs.skip == 'false' && hashFiles('unstuck-report.md') != ''
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: unstuck-report
         path: unstuck-report.md
