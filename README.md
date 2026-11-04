@@ -131,6 +131,13 @@ npm test          # builds, then runs the guard, snapshot, report and team tests
 npm run typecheck
 ```
 
+## Releasing (maintainers)
+
+1. Bump `version` in `package.json` and push.
+2. On GitHub: **Releases → Draft a new release**, tag `vX.Y.Z` matching the version, **Publish**.
+
+The Release workflow tests, publishes to npm with provenance, and moves the `v0` tag. It needs an `NPM_TOKEN` repository secret.
+
 ## Built with
 
 [Claude Agent SDK](https://docs.claude.com/en/docs/agent-sdk/overview) · TypeScript
