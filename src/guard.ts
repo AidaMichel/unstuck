@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 
@@ -109,9 +110,66 @@ const UNSAFE_FLAGS: Record<string, RegExp> = {
   find: /^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/,
   sort: /^(-o|--output(=.*)?|-[a-zA-Z]*o.*)$/,
   rg: /^--pre(=.*)?$/,
-  git: /^(-c|-C|--output(=.*)?|--ext-diff|--textconv|--filters|-O.*|--open-files-in-pager(=.*)?|--exec-path(=.*)?|--git-dir(=.*)?|--work-tree(=.*)?)$/,
+  git: /^(-c|-C|--output(=.*)?|--ext-diff|--textconv|--filters|-O.*|--open-files-in-pager(=.*)?|--exec-path(=.*)?|--git-dir(=.*)?|--work-tree(=.*)?|--no-index|--contents(=.*)?)$/,
   file: /^(-C|--compile)$/,
 };
+
+// Commands whose arguments are plain text, not files.
+const TEXT_ONLY = new Set(["echo", "printf", "tr", "which", "true", "pwd", "basename", "dirname"]);
+const SEARCH = new Set(["grep", "egrep", "fgrep", "rg"]);
+// Short options that take a value (next word, or the rest of the word): not file names.
+const VALUE_SHORT: Record<string, string> = {
+  grep: "ABCmd", egrep: "ABCmd", fgrep: "ABCmd", rg: "ABCmgtTjM", head: "nc", tail: "nc", cut: "dfc", sort: "tkS", du: "d",
+};
+const VALUE_LONG = /^--(context|after-context|before-context|max-count|glob|iglob|type|type-not|threads|max-columns|lines|bytes|delimiter|fields|key|field-separator|max-depth)$/;
+const FIND_VALUE = /^-(name|iname|path|ipath|wholename|iwholename|regex|iregex|type|maxdepth|mindepth|size|mtime|mmin|atime|ctime|perm|user|group|newer)$/;
+
+/**
+ * The words of a command that may name files, for the outside-the-project check.
+ * Search patterns (grep/rg), jq filters, option values and text arguments are skipped so that
+ * `grep -rn "/api/" src` is not mistaken for a path. git is skipped: it confines pathspecs to the
+ * work tree, and its escape hatches (-C, --git-dir, --work-tree, --no-index, --contents) are refused as unsafe flags.
+ */
+export function pathArgs(name: string, args: string[]): string[] {
+  if (TEXT_ONLY.has(name) || name === "git") return [];
+  const out: string[] = [];
+  const search = SEARCH.has(name);
+  const shortValues = VALUE_SHORT[name] ?? "";
+  let needPattern = search || name === "jq";
+  let endOfOptions = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!endOfOptions && a === "--") { endOfOptions = true; continue; }
+    if (!endOfOptions && a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const opt = eq > 0 ? a.slice(0, eq) : a;
+      if (search && opt === "--regexp") { needPattern = false; if (eq < 0) i++; continue; }
+      if (search && opt === "--file") { needPattern = false; if (eq > 0) out.push(a.slice(eq + 1)); else if (i + 1 < args.length) out.push(args[++i]); continue; }
+      if (eq > 0 && /(file|from|dir|path)/i.test(opt)) { out.push(a.slice(eq + 1)); continue; }
+      if (eq < 0 && VALUE_LONG.test(opt)) i++;
+      continue;
+    }
+    if (!endOfOptions && name === "find" && FIND_VALUE.test(a)) { i++; continue; }
+    if (!endOfOptions && a.startsWith("-") && a.length > 1) {
+      // A cluster like -rn, -A3, -e PATTERN, -rnf FILE, -fFILE.
+      for (let j = 1; j < a.length; j++) {
+        const ch = a[j];
+        const isPattern = search && ch === "e";
+        const isFile = search && ch === "f";
+        if (!isPattern && !isFile && !shortValues.includes(ch)) continue;
+        const rest = a.slice(j + 1);
+        const value = rest || (i + 1 < args.length ? args[++i] : "");
+        if (isPattern) needPattern = false;
+        if (isFile) { needPattern = false; if (value) out.push(value); }
+        break;
+      }
+      continue;
+    }
+    if (needPattern) { needPattern = false; continue; } // first positional is the search pattern / jq filter
+    out.push(a);
+  }
+  return out;
+}
 
 /** Split a command into pipeline segments and words. Returns null if it uses shell features we refuse. */
 export function parseReadOnly(cmd: string): { segments: string[][] } | { error: string } {
@@ -160,12 +218,12 @@ function checkReadOnly(cmd: string, repo: string): string | null {
       const sub = args.find((a) => !a.startsWith("-"));
       if (!sub || !READONLY_GIT.has(sub)) return `read-only mode only allows git inspection commands (git ${sub ?? ""})`;
     }
-    for (const a of args) {
-      if (a === "/dev/null" || a.startsWith("-")) continue;
-      const looksLikePath = a.startsWith("/") || a.startsWith("~") || a.split("/").includes("..");
-      if (!looksLikePath) continue;
-      const resolved = a.startsWith("~") ? path.join(process.env.HOME ?? "/", a.slice(1)) : path.resolve(repo, a);
-      if (existsSync(resolved) && !isInside(resolved, repo)) return `reading outside the project is not allowed: ${a}`;
+    // Every word that may name a file must resolve inside the project, whether or not it exists yet.
+    // isInside() follows symlinks for the existing part of the path, so links pointing out are caught too.
+    for (const a of pathArgs(name, args)) {
+      if (a === "/dev/null") continue;
+      const resolved = a.startsWith("~") ? path.join(process.env.HOME || os.homedir(), a.slice(1)) : path.resolve(repo, a);
+      if (!isInside(resolved, repo)) return `reading outside the project is not allowed: ${a}`;
     }
   }
   return null;

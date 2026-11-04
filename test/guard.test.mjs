@@ -124,3 +124,75 @@ test("delegation only in team mode; unknown tools denied", async () => {
   assert.ok(await allowed(makeGuard({ repo, allowWrites: false, allowDelegation: true }), "Agent", { subagent_type: "qa-lead" }));
   for (const t of ["WebFetch", "WebSearch", "mcp__x__y", "Skill"]) assert.ok(!(await allowed(rw, t, {})), t);
 });
+
+// ---- Outside-project paths: portable regression tests (macOS /var/folders vs Linux /tmp) ----
+import { realpathSync as _real, mkdirSync as _mkdir, writeFileSync as _write, symlinkSync as _link, mkdtempSync as _mkdtemp } from "node:fs";
+import { pathArgs } from "../dist/guard.js";
+
+function layout() {
+  const base = _real(_mkdtemp(path.join(tmpdir(), "unstuck-out-")));
+  const project = path.join(base, "project");
+  const outside = path.join(base, "outside");
+  _mkdir(path.join(project, "src"), { recursive: true });
+  _mkdir(outside);
+  _write(path.join(project, "src", "a.ts"), "a");
+  _write(path.join(outside, "secret.txt"), "s");
+  _link(outside, path.join(project, "src", "link-out"));
+  return { base, project, outside, existing: path.join(outside, "secret.txt"), missing: path.join(outside, "no-such-dir", "nothing.txt") };
+}
+
+test("REGRESSION: outside-project paths are refused whether or not they exist", () => {
+  const { project, existing, missing } = layout();
+  const policy = { allowWrites: false, repo: project };
+  const rel = (p) => path.relative(project, p);
+  for (const c of [
+    `cat ${existing}`, `cat ${missing}`, `cat ${rel(existing)}`, `cat ${rel(missing)}`,
+    "cat ../../etc/hostname", "cat ../../../../../../../../no/such/file", "cat ../nope.txt", "ls ..", `head -5 ${missing}`,
+    `grep -rn TODO ${missing}`, `grep -rn "x" ${rel(existing)}`, `find ${missing} -name x`, `wc -l ${existing} src/a.ts`,
+  ]) assert.notEqual(checkCommand(c, policy), null, c);
+});
+
+test("REGRESSION: symlinks pointing out of the project are refused, existing or not", () => {
+  const { project } = layout();
+  const policy = { allowWrites: false, repo: project };
+  for (const c of ["cat src/link-out/secret.txt", "cat src/link-out/missing.txt", "ls src/link-out", "grep -rn x src/link-out"]) {
+    assert.notEqual(checkCommand(c, policy), null, c);
+  }
+});
+
+test("project reached through a symlinked parent (like macOS /var -> /private/var) still works both ways", () => {
+  const { base } = layout();
+  const alias = path.join(base, "alias");
+  _link(base, alias);
+  const project = path.join(alias, "project");
+  const policy = { allowWrites: false, repo: project };
+  for (const c of ["cat src/a.ts", "cat src/not-created-yet.ts", `cat ${path.join(project, "src", "a.ts")}`, `cat ${path.join(base, "project", "src", "a.ts")}`, "ls ."]) {
+    assert.equal(checkCommand(c, policy), null, c);
+  }
+  for (const c of ["cat ../outside/secret.txt", "cat ../outside/missing.txt", `cat ${path.join(alias, "outside", "missing.txt")}`]) {
+    assert.notEqual(checkCommand(c, policy), null, c);
+  }
+});
+
+test("search patterns and text are not mistaken for paths; files hidden behind options are still checked", () => {
+  const { project, existing, missing } = layout();
+  const policy = { allowWrites: false, repo: project };
+  for (const c of [
+    'grep -rn "/api/" src', "grep -rn /etc/passwd src", "grep -e /x/y src", "grep -A 3 /api/ src", "rg -n /api/ src", "rg -g '*.ts' /api/ src",
+    "echo /etc/passwd", "printf '%s' ../x", "jq '.scripts' package.json", "cut -d / -f 2 src/a.ts", "head -n 5 src/a.ts",
+    "find . -name '/x' -path './src/*'", "sort -t / -k 2 src/a.ts",
+  ]) assert.equal(checkCommand(c, policy), null, c);
+  for (const c of [
+    `grep -f ${existing} src`, `grep -f ${missing} src`, `grep -rnf ${missing} src`, `grep -f${missing} src`, `grep --file=${missing} src`,
+    `grep -e x ${missing}`, `grep -ex ${missing}`, `grep --regexp=x ${missing}`, `rg x -- ${missing}`, `jq . ${missing}`,
+    `rg --ignore-file=${missing} x src`, "git diff --no-index ../a ../b", "git blame --contents ../x src/a.ts",
+  ]) assert.notEqual(checkCommand(c, policy), null, c);
+});
+
+test("pathArgs picks out file arguments", () => {
+  assert.deepEqual(pathArgs("grep", ["-rn", "/api/", "src"]), ["src"]);
+  assert.deepEqual(pathArgs("grep", ["-e", "pat", "a", "b"]), ["a", "b"]);
+  assert.deepEqual(pathArgs("grep", ["-rnf", "pats.txt", "src"]), ["pats.txt", "src"]);
+  assert.deepEqual(pathArgs("cat", ["a", "../b"]), ["a", "../b"]);
+  assert.deepEqual(pathArgs("echo", ["/etc/passwd"]), []);
+});
