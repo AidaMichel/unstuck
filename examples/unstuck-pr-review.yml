@@ -1,0 +1,19 @@
+# Copy to .github/workflows/unstuck.yml in your project.
+# Add your key: Settings → Secrets and variables → Actions → New secret → ANTHROPIC_API_KEY
+name: UNSTUCK review
+on:
+  pull_request:
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: AidaMichel/unstuck@v0
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          fail-on: P0   # block merging when a P0 (security, data, money, trust) issue is found

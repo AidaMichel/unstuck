@@ -1,0 +1,5 @@
+node_modules/
+dist/
+unstuck-report.md
+unstuck-fix-report.md
+unstuck-comment.md

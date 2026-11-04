@@ -1,0 +1,52 @@
+{
+  "name": "unstuck",
+  "version": "0.1.0",
+  "description": "An AI agent that reviews, tests, risk-checks and rescues code — especially code built with AI tools.",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "code-review",
+    "qa",
+    "refactor",
+    "security",
+    "compliance",
+    "claude",
+    "vibe-coding",
+    "lovable",
+    "cursor"
+  ],
+  "author": "Aida Michel",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.318",
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  },
+  "type": "module",
+  "bin": {
+    "unstuck": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "prompts",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AidaMichel/unstuck"
+  }
+}

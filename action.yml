@@ -1,0 +1,71 @@
+name: "UNSTUCK review"
+description: "AI review of every pull request: code, refactor plan, QA, risk & compliance, and a challenge pass."
+author: "Aida Michel"
+branding:
+  icon: "shield"
+  color: "purple"
+inputs:
+  anthropic-api-key:
+    description: "Anthropic API key (store it as a repository secret)"
+    required: true
+  mode:
+    description: "review, audit or rescue"
+    default: "review"
+  fail-on:
+    description: "Fail the check if findings at this severity or worse exist (P0, P1, P2). Empty = never fail."
+    default: "P0"
+  model:
+    description: "Claude model to use (optional)"
+    default: ""
+  max-turns:
+    description: "Maximum agent steps"
+    default: "80"
+  comment:
+    description: "Post the report as a pull request comment"
+    default: "true"
+outputs:
+  report-path:
+    description: "Path to the report file"
+    value: ${{ steps.run.outputs.report }}
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+    - name: Install UNSTUCK
+      shell: bash
+      run: cd "${{ github.action_path }}" && npm ci --no-audit --no-fund && npm run build
+    - name: Run UNSTUCK
+      id: run
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        set +e
+        ARGS=("${{ inputs.mode }}" "." --out unstuck-report.md --max-turns "${{ inputs.max-turns }}" --quiet)
+        if [ "${{ inputs.mode }}" = "review" ] && [ -n "$BASE_REF" ]; then
+          git fetch --no-tags --depth=200 origin "$BASE_REF"
+          ARGS+=(--base "origin/$BASE_REF")
+        fi
+        [ -n "${{ inputs.fail-on }}" ] && ARGS+=(--fail-on "${{ inputs.fail-on }}")
+        [ -n "${{ inputs.model }}" ] && ARGS+=(--model "${{ inputs.model }}")
+        node "${{ github.action_path }}/dist/cli.js" "${ARGS[@]}" > /dev/null
+        CODE=$?
+        echo "report=unstuck-report.md" >> "$GITHUB_OUTPUT"
+        echo "code=$CODE" >> "$GITHUB_OUTPUT"
+        [ -f unstuck-report.md ] && cat unstuck-report.md >> "$GITHUB_STEP_SUMMARY"
+        exit 0
+    - name: Comment on pull request
+      if: inputs.comment == 'true' && github.event_name == 'pull_request' && hashFiles('unstuck-report.md') != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        { echo "## 🛟 UNSTUCK review"; echo; cat unstuck-report.md; } > unstuck-comment.md
+        gh pr comment "$PR" --body-file unstuck-comment.md --edit-last 2>/dev/null || gh pr comment "$PR" --body-file unstuck-comment.md
+    - name: Apply severity gate
+      shell: bash
+      run: exit ${{ steps.run.outputs.code }}
