@@ -3,6 +3,8 @@ import path from "node:path";
 import type { CanUseTool, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
 
 // "AI proposes, code decides": every tool call the agent (or any specialist) makes passes through here.
+// This is a policy filter on tool inputs, not an OS sandbox. It lowers risk; it cannot guarantee
+// that a shell command has no side effects (see README, "Limits").
 
 const READ_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "TodoWrite"]);
 const WRITE_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
@@ -84,21 +86,119 @@ export function lockedMatch(target: string, repo: string, locked: string[]): str
   return null;
 }
 
+// Reading a variable whose name looks secret, e.g. echo $ANTHROPIC_API_KEY.
+const SECRET_VAR = /\$\{?[A-Za-z_]*(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Za-z_]*\}?/i;
+
+/*
+ * Read-only shell: an ALLOWLIST of inspection commands.
+ * A denylist cannot make arbitrary shell read-only (any project script, interpreter or tool flag can
+ * write files), so in read-only modes anything not listed here is refused. This is still a best-effort
+ * filter on the command text, not a sandbox: see "Limits" in the README.
+ */
+const READONLY_COMMANDS = new Set([
+  "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "find", "sort", "cut", "tr", "jq",
+  "file", "stat", "du", "echo", "printf", "pwd", "which", "diff", "cmp", "basename", "dirname", "realpath",
+  "readlink", "nl", "column", "md5sum", "sha1sum", "sha256sum", "true", "git",
+]);
+const READONLY_GIT = new Set([
+  "log", "diff", "show", "status", "blame", "ls-files", "ls-tree", "rev-parse", "rev-list", "describe",
+  "shortlog", "grep", "cat-file", "merge-base", "name-rev", "count-objects",
+]);
+/** Flags that make an otherwise read-only command write files or run other programs. */
+const UNSAFE_FLAGS: Record<string, RegExp> = {
+  find: /^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/,
+  sort: /^(-o|--output(=.*)?|-[a-zA-Z]*o.*)$/,
+  rg: /^--pre(=.*)?$/,
+  git: /^(-c|-C|--output(=.*)?|--ext-diff|--textconv|--filters|-O.*|--open-files-in-pager(=.*)?|--exec-path(=.*)?|--git-dir(=.*)?|--work-tree(=.*)?)$/,
+  file: /^(-C|--compile)$/,
+};
+
+/** Split a command into pipeline segments and words. Returns null if it uses shell features we refuse. */
+export function parseReadOnly(cmd: string): { segments: string[][] } | { error: string } {
+  // Harmless redirections we accept, removed before parsing.
+  const text = cmd.replace(/(^|\s)(?:[12]?>|&>)\s*\/dev\/null(?=\s|$)/g, " ").replace(/(^|\s)2>&1(?=\s|$)/g, " ");
+  const segments: string[][] = [];
+  let words: string[] = [], word = "", inWord = false, quote: "'" | '"' | null = null;
+  const endWord = () => { if (inWord) words.push(word); word = ""; inWord = false; };
+  const endSegment = () => { endWord(); if (words.length) segments.push(words); words = []; };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote === "'") { if (c === "'") quote = null; else word += c; continue; }
+    if (quote === '"') {
+      if (c === '"') { quote = null; continue; }
+      if (c === "$" || c === "`") return { error: "variable or command expansion is not allowed in read-only mode" };
+      if (c === "\\" && i + 1 < text.length) { word += text[++i]; continue; }
+      word += c; continue;
+    }
+    if (c === "'" || c === '"') { quote = c; inWord = true; continue; }
+    if (c === "\\") { if (i + 1 < text.length) { word += text[++i]; inWord = true; } continue; }
+    if (c === "$" || c === "`") return { error: "variable or command expansion is not allowed in read-only mode" };
+    if (c === ">" || c === "<") return { error: "redirecting to or from files is not allowed in read-only mode" };
+    if (c === "(" || c === ")" || c === "{" || c === "}") return { error: "subshells and groups are not allowed in read-only mode" };
+    if (c === "|") { if (text[i + 1] === "|") i++; endSegment(); continue; }
+    if (c === "&") { if (text[i + 1] === "&") { i++; endSegment(); continue; } return { error: "background jobs are not allowed in read-only mode" }; }
+    if (c === ";" || c === "\n") { endSegment(); continue; }
+    if (/\s/.test(c)) { endWord(); continue; }
+    word += c; inWord = true;
+  }
+  if (quote) return { error: "unbalanced quotes" };
+  endSegment();
+  if (!segments.length) return { error: "empty command" };
+  return { segments };
+}
+
+function checkReadOnly(cmd: string, repo: string): string | null {
+  const parsed = parseReadOnly(cmd);
+  if ("error" in parsed) return parsed.error;
+  for (const [name, ...args] of parsed.segments) {
+    if (!READONLY_COMMANDS.has(name)) {
+      return `read-only mode only allows inspection commands; \`${name}\` is not one (project scripts need --run-checks)`;
+    }
+    const unsafe = UNSAFE_FLAGS[name];
+    if (unsafe) for (const a of args) if (unsafe.test(a)) return `\`${name} ${a}\` can write files or run programs`;
+    if (name === "git") {
+      const sub = args.find((a) => !a.startsWith("-"));
+      if (!sub || !READONLY_GIT.has(sub)) return `read-only mode only allows git inspection commands (git ${sub ?? ""})`;
+    }
+    for (const a of args) {
+      if (a === "/dev/null" || a.startsWith("-")) continue;
+      const looksLikePath = a.startsWith("/") || a.startsWith("~") || a.split("/").includes("..");
+      if (!looksLikePath) continue;
+      const resolved = a.startsWith("~") ? path.join(process.env.HOME ?? "/", a.slice(1)) : path.resolve(repo, a);
+      if (existsSync(resolved) && !isInside(resolved, repo)) return `reading outside the project is not allowed: ${a}`;
+    }
+  }
+  return null;
+}
+
+export interface CommandPolicy {
+  /** fix mode: may change files. */
+  allowWrites: boolean;
+  /** --run-checks: may run project scripts (tests, build, lint) in read-only modes. */
+  allowScripts?: boolean;
+  repo?: string;
+}
+
 /** Why a shell command is blocked, or null if it is allowed. */
-export function checkCommand(cmd: string, allowWrites: boolean): string | null {
+export function checkCommand(cmd: string, policy: CommandPolicy): string | null {
   for (const [re, why] of ALWAYS_BLOCKED) if (re.test(cmd)) return why;
-  if (!allowWrites) for (const [re, why] of MUTATING) if (re.test(cmd)) return `read-only mode: this command ${why}`;
+  if (SECRET_VAR.test(cmd)) return "reading secret environment variables";
+  if (policy.allowWrites) return null;
+  if (!policy.allowScripts) return checkReadOnly(cmd, policy.repo ?? process.cwd());
+  // --run-checks: project scripts may run; still refuse commands that obviously change files.
+  for (const [re, why] of MUTATING) if (re.test(cmd)) return `read-only mode: this command ${why}`;
   return null;
 }
 
 export interface GuardOptions {
   repo: string;
   allowWrites: boolean;
+  allowScripts?: boolean;
   allowDelegation?: boolean;
   log?: (msg: string) => void;
 }
 
-export function makeGuard({ repo, allowWrites, allowDelegation = false, log }: GuardOptions): CanUseTool {
+export function makeGuard({ repo, allowWrites, allowScripts = false, allowDelegation = false, log }: GuardOptions): CanUseTool {
   const locked = readLockedFiles(repo);
   const deny = (message: string): PermissionResult => {
     log?.(`✋ blocked: ${message}`);
@@ -134,7 +234,7 @@ export function makeGuard({ repo, allowWrites, allowDelegation = false, log }: G
 
     if (toolName === "Bash") {
       const cmd = String(input.command ?? "");
-      const why = checkCommand(cmd, allowWrites);
+      const why = checkCommand(cmd, { allowWrites, allowScripts, repo });
       if (why) return deny(`${why}: ${cmd.slice(0, 160)}`);
       return allow(input);
     }

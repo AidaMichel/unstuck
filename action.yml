@@ -26,6 +26,9 @@ inputs:
   max-turns:
     description: "Maximum agent steps"
     default: "100"
+  run-checks:
+    description: "Let UNSTUCK run the project's tests, build and lint. They execute code from the pull request with the API key in the environment; only enable for trusted branches."
+    default: "false"
   comment:
     description: "Post the report as a pull request comment (updated on every push)"
     default: "true"
@@ -72,10 +75,14 @@ runs:
         IN_MODEL: ${{ inputs.model }}
         IN_LANG: ${{ inputs.lang }}
         IN_TURNS: ${{ inputs.max-turns }}
+        IN_CHECKS: ${{ inputs.run-checks }}
       run: |
         set +e
+        # The report is written outside the checked-out project.
+        REPORT="$RUNNER_TEMP/unstuck-report.md"
+        rm -f "$REPORT"
         case "$IN_MODE" in review|audit|rescue) ;; *) echo "::error::mode must be review, audit or rescue"; exit 1;; esac
-        ARGS=("$IN_MODE" "." --out unstuck-report.md --max-turns "$IN_TURNS" --quiet)
+        ARGS=("$IN_MODE" "." --out "$REPORT" --max-turns "$IN_TURNS" --quiet)
         if [ "$IN_MODE" = "review" ] && [ -n "$BASE_REF" ]; then
           git fetch --no-tags --depth=500 origin "$BASE_REF" >/dev/null 2>&1
           ARGS+=(--base "origin/$BASE_REF")
@@ -84,34 +91,37 @@ runs:
         [ -n "$IN_MODEL" ] && ARGS+=(--model "$IN_MODEL")
         [ -n "$IN_LANG" ] && ARGS+=(--lang "$IN_LANG")
         if [ "$IN_TEAM" = "true" ]; then ARGS+=(--team); else ARGS+=(--solo); fi
+        [ "$IN_CHECKS" = "true" ] && ARGS+=(--run-checks)
         node "$GITHUB_ACTION_PATH/dist/cli.js" "${ARGS[@]}" > /dev/null
         CODE=$?
-        echo "report=unstuck-report.md" >> "$GITHUB_OUTPUT"
         echo "code=$CODE" >> "$GITHUB_OUTPUT"
-        if [ -f unstuck-report.md ]; then
-          head -c 900000 unstuck-report.md >> "$GITHUB_STEP_SUMMARY"
+        if [ -f "$REPORT" ]; then
+          echo "report=$REPORT" >> "$GITHUB_OUTPUT"
+          head -c 900000 "$REPORT" >> "$GITHUB_STEP_SUMMARY"
         fi
         exit 0
     - name: Upload report
-      if: steps.key.outputs.skip == 'false' && hashFiles('unstuck-report.md') != ''
+      if: steps.key.outputs.skip == 'false' && steps.run.outputs.report != ''
       uses: actions/upload-artifact@v5
       with:
         name: unstuck-report
-        path: unstuck-report.md
+        path: ${{ steps.run.outputs.report }}
     - name: Comment on pull request
-      if: steps.key.outputs.skip == 'false' && inputs.comment == 'true' && github.event_name == 'pull_request' && hashFiles('unstuck-report.md') != ''
+      if: steps.key.outputs.skip == 'false' && inputs.comment == 'true' && github.event_name == 'pull_request' && steps.run.outputs.report != ''
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         PR: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
+        REPORT: ${{ steps.run.outputs.report }}
       run: |
-        node "$GITHUB_ACTION_PATH/dist/comment.js" unstuck-report.md unstuck-comment.md
+        BODY="$RUNNER_TEMP/unstuck-comment.md"
+        node "$GITHUB_ACTION_PATH/dist/comment.js" "$REPORT" "$BODY"
         ID=$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq '.[] | select(.body | startswith("<!-- unstuck:comment -->")) | .id' 2>/dev/null | tail -1)
         if [ -n "$ID" ]; then
-          gh api -X PATCH "repos/$REPO/issues/comments/$ID" -F body=@unstuck-comment.md >/dev/null
+          gh api -X PATCH "repos/$REPO/issues/comments/$ID" -F body=@"$BODY" >/dev/null
         else
-          gh pr comment "$PR" --repo "$REPO" --body-file unstuck-comment.md
+          gh pr comment "$PR" --repo "$REPO" --body-file "$BODY"
         fi
     - name: Apply severity gate
       if: steps.key.outputs.skip == 'false'

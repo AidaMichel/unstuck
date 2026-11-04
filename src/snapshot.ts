@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, writeFileSync, mkdirSync, lstatSync } from "node:fs";
+import { readdirSync, readFileSync, lstatSync } from "node:fs";
 import path from "node:path";
 
-// The guard blocks known-bad actions. The snapshot catches anything it missed
-// (a test script that writes files, an inline script, a tool we didn't foresee):
-// it fingerprints the project before a run and compares afterwards.
+// The guard blocks known-bad actions. The snapshot is an observer: it fingerprints the project
+// before a run and compares afterwards, so changes are reported. It never writes or restores
+// anything — another editor or agent may be working in the same folder, and its changes are not ours to undo.
 
 const SKIP_DIRS = new Set([
   ".git", "node_modules", "dist", "build", "out", ".next", ".nuxt", ".svelte-kit", ".turbo", ".vercel",
@@ -13,11 +13,9 @@ const SKIP_DIRS = new Set([
 ]);
 const SKIP_FILES = /(\.tsbuildinfo|\.log|\.DS_Store|\.pyc)$|^unstuck-(fix-)?report\.md$|^unstuck-comment\.md$/;
 const MAX_FILES = 50_000;
-const MAX_KEEP_BYTES = 2_000_000; // file contents kept for restoring locked files
 
 export interface Snapshot {
   hashes: Map<string, string>;
-  kept: Map<string, Buffer>; // contents of protected (locked) files
   truncated: boolean;
 }
 
@@ -40,19 +38,17 @@ function walk(root: string, dir: string, out: string[]): boolean {
   return true;
 }
 
-export function takeSnapshot(repo: string, isProtected: (rel: string) => boolean = () => false): Snapshot {
+export function takeSnapshot(repo: string): Snapshot {
   const files: string[] = [];
   const complete = walk(repo, repo, files);
   const hashes = new Map<string, string>();
-  const kept = new Map<string, Buffer>();
   for (const rel of files) {
     try {
       const buf = readFileSync(path.join(repo, rel));
       hashes.set(rel, createHash("sha256").update(buf).digest("hex"));
-      if (isProtected(rel) && buf.length <= MAX_KEEP_BYTES) kept.set(rel, buf);
     } catch { /* unreadable: skip */ }
   }
-  return { hashes, kept, truncated: !complete };
+  return { hashes, truncated: !complete };
 }
 
 export interface Diff { added: string[]; changed: string[]; removed: string[] }
@@ -68,20 +64,6 @@ export function diffSnapshots(before: Snapshot, after: Snapshot): Diff {
   return { added: added.sort(), changed: changed.sort(), removed: removed.sort() };
 }
 
-/** Put protected files back exactly as they were. Returns the files restored. */
-export function restoreProtected(repo: string, before: Snapshot, diff: Diff): string[] {
-  const restored: string[] = [];
-  for (const rel of [...diff.changed, ...diff.removed]) {
-    const buf = before.kept.get(rel);
-    if (!buf) continue;
-    const full = path.join(repo, rel);
-    mkdirSync(path.dirname(full), { recursive: true });
-    writeFileSync(full, buf);
-    restored.push(rel);
-  }
-  return restored;
-}
-
 export function totalChanges(d: Diff): number {
   return d.added.length + d.changed.length + d.removed.length;
 }
@@ -93,4 +75,42 @@ export function describeDiff(d: Diff, limit = 20): string {
     ...d.removed.map((f) => `  removed  ${f}`),
   ];
   return lines.length > limit ? [...lines.slice(0, limit), `  …and ${lines.length - limit} more`].join("\n") : lines.join("\n");
+}
+
+export interface ChangeNotice {
+  /** Markdown appended to the report. Empty when nothing changed. */
+  markdown: string;
+  /** Short text for the terminal. */
+  console: string;
+  /** True when the run should exit non-zero (a locked file changed during `fix`). */
+  fail: boolean;
+}
+
+/**
+ * Describe changes seen during a run without claiming who made them.
+ * Nothing is reverted: another editor or agent may be working in the same project.
+ */
+export function describeChanges(
+  d: Diff,
+  opts: { writes: boolean; ranScripts: boolean; lockedChanged: string[] },
+): ChangeNotice {
+  const locked = opts.lockedChanged;
+  if (!opts.writes) {
+    if (totalChanges(d) === 0) return { markdown: "", console: "", fail: false };
+    const cause = opts.ranScripts
+      ? "This run was allowed to execute project scripts (--run-checks), which can write files such as build output or caches. Another editor or agent working in this folder at the same time could also be the cause. UNSTUCK cannot tell which."
+      : "This run did not execute project scripts, so the most likely cause is another editor, agent or process working in this folder at the same time. UNSTUCK cannot confirm the cause.";
+    const markdown =
+      `\n\n> ⚠️ **Files changed while UNSTUCK was running.** ${cause} Nothing was reverted. ` +
+      `Findings may reflect a mix of old and new code; re-run once the project is quiet.` +
+      (locked.length ? ` Locked files among them: ${locked.join(", ")}.` : "") +
+      `\n\n\`\`\`\n${describeDiff(d)}\n\`\`\`\n`;
+    return { markdown, console: `Files changed during the run (not reverted, cause unknown):\n${describeDiff(d)}`, fail: false };
+  }
+  if (!locked.length) return { markdown: "", console: "", fail: false };
+  const markdown =
+    `\n\n> ⛔ **Locked files changed during this fix run:** ${locked.join(", ")}. ` +
+    `UNSTUCK's edit tools are blocked from these files, so the change came from a command it ran or from another process working at the same time. ` +
+    `Nothing was reverted. Check them with \`git diff\` before keeping anything.\n`;
+  return { markdown, console: `Locked files changed during the run (not reverted): ${locked.join(", ")}`, fail: true };
 }

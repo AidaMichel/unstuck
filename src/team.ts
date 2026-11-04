@@ -15,7 +15,7 @@ const SHARED = `You are a specialist on the UNSTUCK review team: senior people w
 The lead gives you a project brief (stack, domain, users, rules, locked files) and a scope. Do ONLY your own pass, deeply. Other specialists cover the rest.
 
 Rules:
-- You are read-only. Do not try to edit files; the tool blocks it.
+- You are read-only. Do not try to edit files or run commands that write; the tool refuses them. Follow the Checks setting in the lead's brief.
 - Evidence over opinion: every finding needs file:line and what you actually read or ran. If you could not verify something, mark it confidence: low.
 - Never invent problems to look thorough. "Nothing serious found" is a valid result.
 - Never print secret values (keys, tokens, passwords). Say where they are, masked.
@@ -57,7 +57,7 @@ const SPECS: Spec[] = [
     title: "QA Lead",
     pass: 3,
     description: "QA lead. Runs the tests, typecheck, lint and build, reports exact counts, and designs the missing test cases.",
-    extra: "Start by finding how this project runs its checks (package.json scripts, Makefile, CI config) and run them. After the findings, add 'Checks run' (command → result with exact counts, or 'not run' and why) and 'Missing tests' (input → expected result), highest value first.",
+    extra: "Start by finding how this project runs its checks (package.json scripts, Makefile, CI config). Run them only if the brief says Checks: ENABLED; otherwise list them as 'not run — re-run with --run-checks'. After the findings, add 'Checks run' (command → result with exact counts, or 'not run' and why) and 'Missing tests' (input → expected result), highest value first.",
   },
   {
     key: "risk-compliance",
@@ -96,7 +96,7 @@ export const LEAD_ADDENDUM = `
 You lead a team of five specialists, available through the Agent tool: ${SPECIALISTS.join(", ")}.
 
 1. Do Step 0 yourself (learn the project) and decide the scope. In rescue mode, also do the Triage step yourself.
-2. Brief ALL five specialists in parallel — one message with five Agent calls. Give each the same project brief (stack, domain, users, region, permanent rules, locked files, priorities) and the exact scope (e.g. the git diff range, or "whole repo"). Ask each for their pass only.
+2. Brief ALL five specialists in parallel — one message with five Agent calls. Give each the same project brief (stack, domain, users, region, permanent rules, locked files, priorities), the Checks setting from your task (ENABLED or DISABLED) and the exact scope (e.g. the git diff range, or "whole repo"). Ask each for their pass only.
 3. When they report back:
    - Merge duplicates and resolve conflicts between specialists.
    - Verify every P0 and P1 yourself by reading the cited code. Drop or downgrade anything you cannot confirm. Note "verified by lead" on what you checked.

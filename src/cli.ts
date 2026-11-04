@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
-import { existsSync, readFileSync, writeFileSync, copyFileSync, appendFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, copyFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { makeGuard, readLockedFiles, lockedMatch } from "./guard.js";
 import { gate, redact } from "./report.js";
-import { takeSnapshot, diffSnapshots, restoreProtected, describeDiff, totalChanges } from "./snapshot.js";
+import { takeSnapshot, diffSnapshots, describeChanges } from "./snapshot.js";
+import { resolveReportPath, writeReportFile, latestReportPath, UnsafePathError } from "./paths.js";
 import { buildTeam, LEAD_ADDENDUM } from "./team.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -17,7 +18,8 @@ export type Mode = "review" | "audit" | "rescue" | "fix";
 
 interface RunOptions {
   repo: string;
-  out: string;
+  out?: string;
+  runChecks: boolean;
   model?: string;
   maxTurns: number;
   base?: string;
@@ -36,13 +38,16 @@ function hasCredentials(): boolean {
   return Boolean(e.ANTHROPIC_API_KEY || e.CLAUDE_CODE_OAUTH_TOKEN || e.CLAUDE_CODE_USE_BEDROCK || e.CLAUDE_CODE_USE_VERTEX);
 }
 
-export function taskFor(mode: Mode, o: Pick<RunOptions, "repo" | "base" | "team" | "lang">, extra?: string): string {
+export function taskFor(mode: Mode, o: Pick<RunOptions, "repo" | "base" | "team" | "lang" | "runChecks">, extra?: string): string {
   const locked = readLockedFiles(o.repo);
   const lockedLine = locked.length
     ? `Locked files (enforced by the tool, edits are blocked and reverted): ${locked.join(", ")}.`
     : "No locked files declared.";
   const lang = o.lang ? `Write the whole report in ${o.lang}. Keep code, file paths, IDs and the summary line as they are.` : "";
   const team = o.team ? "Work as the team lead described in Team mode." : "Work alone: do all passes yourself.";
+  const checks = mode === "fix" || o.runChecks
+    ? "Checks: ENABLED. You may run the project's tests, typecheck, lint and build."
+    : "Checks: DISABLED. Do not run project scripts (tests, build, lint, package managers, interpreters); the tool refuses them. List the commands you would run and mark them 'not run — re-run with --run-checks'. Use only inspection commands (git log/diff/show/status, ls, cat, grep, find, head, tail, wc).";
   const lines: string[] = [];
   switch (mode) {
     case "review":
@@ -51,14 +56,14 @@ export function taskFor(mode: Mode, o: Pick<RunOptions, "repo" | "base" | "team"
         o.base
           ? `Scope: changes between \`${o.base}\` and HEAD. Start with \`git diff ${o.base}...HEAD --stat\` and \`git diff ${o.base}...HEAD\`.`
           : "Scope: changes since the last git tag, or the last 10 commits if there is no tag. Also include uncommitted changes (`git status`, `git diff`). If this is not a git repo, review the most important source files.",
-        lockedLine, team, "Run all five passes and produce the report.",
+        lockedLine, team, checks, "Run all five passes and produce the report.",
       );
       break;
     case "audit":
-      lines.push("Mode: audit.", "Scope: the whole repository.", lockedLine, team, "Run all five passes and produce the report.");
+      lines.push("Mode: audit.", "Scope: the whole repository.", lockedLine, team, checks, "Run all five passes and produce the report.");
       break;
     case "rescue":
-      lines.push("Mode: rescue.", "Scope: the whole repository.", lockedLine, team,
+      lines.push("Mode: rescue.", "Scope: the whole repository.", lockedLine, team, checks,
         "Follow Rescue mode, then add the most important findings from the five passes, and produce the report.");
       break;
     case "fix":
@@ -68,7 +73,7 @@ export function taskFor(mode: Mode, o: Pick<RunOptions, "repo" | "base" | "team"
         "The previous UNSTUCK report is below. Apply one item at a time. After each item, run the relevant tests, typecheck and build (whatever exists).",
         "If an item touches a locked file, needs a secret, a migration, a CI workflow, or a production change, skip it and say why.",
         "Never refactor and change behavior in the same item. Never weaken or delete a test to make it pass. Do not commit.",
-        lockedLine,
+        lockedLine, checks,
         "Finish with a short report: for each item — applied / skipped, files changed, verification results with exact counts, anything the reader must check by hand.",
         "Last line: <!-- unstuck:summary P0=0 P1=0 P2=0 P3=0 -->",
       );
@@ -83,6 +88,13 @@ async function run(mode: Mode, o: RunOptions, extra?: string, previousReport?: s
     console.error(`Project folder not found: ${o.repo}`);
     return 2;
   }
+  let outPath: string;
+  try {
+    outPath = resolveReportPath(o.repo, mode, o.out);
+  } catch (err) {
+    if (err instanceof UnsafePathError) { console.error(err.message); return 2; }
+    throw err;
+  }
   if (!hasCredentials()) {
     console.error("Set ANTHROPIC_API_KEY first. Get a key at https://console.anthropic.com");
     return 2;
@@ -90,14 +102,15 @@ async function run(mode: Mode, o: RunOptions, extra?: string, previousReport?: s
 
   const writes = mode === "fix";
   const team = o.team && !writes;
+  const scripts = writes || o.runChecks;
   const locked = readLockedFiles(o.repo);
-  const before = takeSnapshot(o.repo, (rel) => lockedMatch(rel, o.repo, locked) !== null);
+  const before = takeSnapshot(o.repo);
   if (before.truncated) warn("Large project: the change check covers the first 50,000 files only.");
 
   const prompt = previousReport
     ? `${taskFor(mode, { ...o, team }, extra)}\n\n---\nPrevious report:\n\n${previousReport}`
     : taskFor(mode, { ...o, team });
-  process.stderr.write(`🛟 UNSTUCK ${VERSION} · ${mode}${team ? " · team" : ""} · ${o.repo}\n`);
+  process.stderr.write(`🛟 UNSTUCK ${VERSION} · ${mode}${team ? " · team" : ""}${!writes ? (scripts ? " · checks on" : " · read-only, no scripts") : ""} · ${o.repo}\n`);
 
   let report = "";
   let cost = 0;
@@ -115,7 +128,9 @@ async function run(mode: Mode, o: RunOptions, extra?: string, previousReport?: s
         ],
         ...(team ? { agents: buildTeam(SYSTEM_PROMPT, o.model) } : {}),
         permissionMode: "default",
-        canUseTool: makeGuard({ repo: o.repo, allowWrites: writes, allowDelegation: team, log: o.quiet ? undefined : log }),
+        canUseTool: makeGuard({ repo: o.repo, allowWrites: writes, allowScripts: scripts, allowDelegation: team, log: o.quiet ? undefined : log }),
+        // Best effort: stop git from refreshing its index during read-only inspection.
+        env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat", PAGER: "cat" },
         settingSources: [], // ignore the user's own Claude settings so UNSTUCK behaves the same everywhere
         maxTurns: o.maxTurns,
         ...(o.model ? { model: o.model } : {}),
@@ -140,32 +155,30 @@ async function run(mode: Mode, o: RunOptions, extra?: string, previousReport?: s
     failed = (err as Error).message;
   }
 
-  // Backstop: compare the project with how it was before the run.
-  const after = takeSnapshot(o.repo);
-  const diff = diffSnapshots(before, after);
-  const restored = restoreProtected(o.repo, before, diff);
-  let notes = "";
-  if (restored.length) {
-    notes += `\n\n> ⛔ **UNSTUCK restored ${restored.length} locked file(s)** that were changed during the run: ${restored.join(", ")}.\n`;
-    warn(`Restored locked files: ${restored.join(", ")}`);
-  }
-  if (!writes && totalChanges(diff) > restored.length) {
-    notes += `\n\n> ⚠️ **Files changed during a read-only run** (usually a test or build script writing output). Check with \`git status\`:\n\n\`\`\`\n${describeDiff(diff)}\n\`\`\`\n`;
-    warn(`Files changed during a read-only run:\n${describeDiff(diff)}`);
-  }
+  // Observe (never revert) what changed in the project while UNSTUCK ran.
+  const diff = diffSnapshots(before, takeSnapshot(o.repo));
+  const lockedChanged = [...diff.changed, ...diff.removed].filter((rel) => lockedMatch(rel, o.repo, locked) !== null);
+  const notice = describeChanges(diff, { writes, ranScripts: scripts, lockedChanged });
+  if (notice.console) warn(notice.console);
 
   if (failed) {
     console.error(`\nThe run stopped early (${failed}). Try a larger --max-turns or a narrower scope.`);
     if (!report) return 1;
   }
 
-  report = redact(report.trim()) + notes;
-  const outPath = path.resolve(o.repo, o.out);
-  writeFileSync(outPath, report + "\n");
+  report = redact(report.trim()) + notice.markdown;
+  try {
+    writeReportFile(outPath, report + "\n", o.repo);
+    if (!o.out && mode !== "fix") writeReportFile(latestReportPath(o.repo), report + "\n", o.repo);
+  } catch (err) {
+    console.error(`Could not save the report: ${(err as Error).message}`);
+    process.stdout.write("\n" + report + "\n");
+    return 1;
+  }
   process.stdout.write("\n" + report + "\n");
   process.stderr.write(`\nReport saved to ${outPath}${cost ? ` · cost ≈ $${cost.toFixed(2)}` : ""}\n`);
 
-  if (failed) return 1;
+  if (failed || notice.fail) return 1;
   return gate(report, o.failOn, warn);
 }
 
@@ -177,7 +190,8 @@ const program = new Command()
 const common = (c: Command, defaultTeam: boolean) =>
   c
     .argument("[path]", "project folder", ".")
-    .option("-o, --out <file>", "where to save the report (inside the project)", "unstuck-report.md")
+    .option("-o, --out <file>", "where to save the report (must be outside the project; default ~/.unstuck/reports/…)")
+    .option("--run-checks", "allow running the project's tests, build and lint (they can execute code and write files)")
     .option("-m, --model <model>", "Claude model to use, e.g. opus or sonnet")
     .option("--max-turns <n>", "maximum agent steps", "100")
     .option("--fail-on <level>", "exit with code 1 if findings at this severity or worse exist (P0, P1, P2, P3)")
@@ -188,7 +202,8 @@ const common = (c: Command, defaultTeam: boolean) =>
 
 const opts = (p: string, c: Record<string, string | boolean | undefined>, defaultTeam: boolean): RunOptions => ({
   repo: path.resolve(p),
-  out: String(c.out),
+  out: c.out ? String(c.out) : undefined,
+  runChecks: Boolean(c.runChecks),
   model: c.model as string | undefined,
   maxTurns: Math.max(1, Number(c.maxTurns) || 100),
   base: c.base as string | undefined,
@@ -215,8 +230,8 @@ program
   .description("apply chosen items from the last report, e.g. unstuck fix F1,R2")
   .argument("<ids>", "comma-separated IDs from the report")
   .argument("[path]", "project folder", ".")
-  .option("-r, --report <file>", "report to apply from", "unstuck-report.md")
-  .option("-o, --out <file>", "where to save the fix report", "unstuck-fix-report.md")
+  .option("-r, --report <file>", "report to apply from (default: this project's latest report)")
+  .option("-o, --out <file>", "where to save the fix report (must be outside the project)")
   .option("-m, --model <model>", "Claude model to use")
   .option("--max-turns <n>", "maximum agent steps", "150")
   .option("--lang <language>", "write the report in this language")
@@ -228,7 +243,14 @@ program
       console.error(`Invalid IDs: ${bad.join(", ") || ids}. Use IDs from the report, e.g. F1,R2,S3.`);
       return done(2);
     }
-    const reportPath = path.resolve(p, c.report);
+    const repo = path.resolve(p);
+    let reportPath: string;
+    try {
+      reportPath = c.report ? path.resolve(c.report) : latestReportPath(repo);
+    } catch (err) {
+      console.error((err as Error).message);
+      return done(2);
+    }
     if (!existsSync(reportPath)) {
       console.error(`No report found at ${reportPath}. Run \`unstuck review\` first.`);
       return done(2);
@@ -247,12 +269,6 @@ program
     else {
       copyFileSync(path.join(ROOT, "templates", "GUARDIAN.md"), target);
       console.log(`Created ${target}. Fill in your rules and locked files, then run \`unstuck review\`.`);
-    }
-    const gi = path.join(repo, ".gitignore");
-    const has = existsSync(gi) && /^unstuck-\*report\.md$/m.test(readFileSync(gi, "utf8"));
-    if (!has) {
-      appendFileSync(gi, `${existsSync(gi) && !readFileSync(gi, "utf8").endsWith("\n") ? "\n" : ""}unstuck-*report.md\n`);
-      console.log("Added unstuck-*report.md to .gitignore.");
     }
   });
 
