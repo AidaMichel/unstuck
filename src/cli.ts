@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command, Option } from "commander";
-import { existsSync, readFileSync, copyFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, copyFileSync, statSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { makeGuard, readLockedFiles, lockedMatch } from "./guard.js";
@@ -11,7 +11,12 @@ import { buildTeam, LEAD_ADDENDUM } from "./team.js";
 import { collectFacts } from "./offline/facts.js";
 import { runRules } from "./offline/rules.js";
 import { renderReport } from "./offline/render.js";
-import { detectLocalModel, isLocalUrl, localDiagnosis } from "./llm.js";
+import { detectLocalModel, isLocalUrl, diagnoseWith, httpBackend } from "./llm.js";
+import { CATALOG, catalogModel, defaultModel, formatBytes, sourceUrl } from "./embedded/catalog.js";
+import { chooseModel, installedModels, modelDir, sidecarPath, ModelFileError } from "./embedded/store.js";
+import { remoteInfo, consentText, askConsent, downloadModel } from "./embedded/download.js";
+import { embeddedBackend, findRuntime, platformPackage, runtimeDir, RUNTIME_VERSION } from "./embedded/runtime.js";
+import { spawnSync } from "node:child_process";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SYSTEM_PROMPT = readFileSync(path.join(ROOT, "prompts", "guardian.md"), "utf8");
@@ -35,9 +40,11 @@ interface RunOptions {
   localModel?: string;
   allowRemoteLlm: boolean;
   note?: string;
+  modelFile?: string;
+  embeddedModel?: string;
 }
 
-export type Engine = "auto" | "offline" | "local" | "claude";
+export type Engine = "auto" | "offline" | "local" | "embedded" | "claude";
 
 const dim = (s: string) => (process.stderr.isTTY ? `\x1b[2m${s}\x1b[0m` : s);
 const log = (s: string) => process.stderr.write(dim(`  ${s}`) + "\n");
@@ -106,7 +113,7 @@ async function run(mode: Mode, o: RunOptions, extra?: string, previousReport?: s
     throw err;
   }
   // Free engines: no account, no API key. Claude is used only when asked for, or in auto mode when a key is set.
-  if (mode !== "fix" && (o.engine === "offline" || o.engine === "local" || (o.engine === "auto" && !hasCredentials()))) {
+  if (mode !== "fix" && (o.engine === "offline" || o.engine === "local" || o.engine === "embedded" || (o.engine === "auto" && !hasCredentials()))) {
     return runFree(mode, o, outPath);
   }
   if (!hasCredentials()) {
@@ -199,6 +206,38 @@ async function run(mode: Mode, o: RunOptions, extra?: string, previousReport?: s
   return gate(report, o.failOn, warn);
 }
 
+type FactsT = ReturnType<typeof collectFacts>;
+type FindingsT = ReturnType<typeof runRules>;
+
+/** Embedded engine: any problem gives a clearly labelled offline report, never an error. */
+async function runEmbedded(mode: Mode, o: RunOptions, facts: FactsT, findings: FindingsT): Promise<{ report: string; engineLabel: string }> {
+  const offline = (why: string) => {
+    if (!o.quiet) log(why);
+    return { report: renderReport(facts, findings, o.note, `The embedded AI model was not used: ${why}. This is UNSTUCK's free offline diagnosis instead.`), engineLabel: "offline (fallback: embedded model not used)" };
+  };
+  let choice;
+  try { choice = chooseModel({ file: o.modelFile, id: o.embeddedModel }); } catch (err) { return offline((err as Error).message); }
+  if (!choice) return offline(`no embedded model is installed${o.embeddedModel ? ` for "${o.embeddedModel}"` : ""} (run \`unstuck model download\` to get one; it asks before downloading)`);
+  if (!findRuntime()) return offline("the embedded AI runtime isn't installed (run `unstuck model runtime`; it asks before installing)");
+  process.stderr.write(`🛟 UNSTUCK ${VERSION} · ${mode} · engine: embedded model ${choice.label} · ${o.repo}\n`);
+  let loaded;
+  try {
+    if (!o.quiet) log(`loading ${choice.label}…`);
+    loaded = await embeddedBackend(choice);
+  } catch (err) {
+    const msg = err instanceof ModelFileError ? err.message : `could not load the model (${(err as Error).message.split("\n")[0].slice(0, 200)})`;
+    return offline(msg);
+  }
+  try {
+    const r = await diagnoseWith(loaded.backend, facts, findings, o.note, o.lang, o.quiet ? undefined : log);
+    const s = loaded.stats;
+    if (!o.quiet) log(`embedded model: loaded in ${(s.loadMs / 1000).toFixed(1)}s, context ${s.contextTokens} tokens${s.answerMs !== undefined ? `, answered in ${(s.answerMs / 1000).toFixed(1)}s` : ""}${s.peakRssMB ? `, peak memory ${s.peakRssMB} MB` : ""}`);
+    return { report: r.report, engineLabel: r.usedModel ? `embedded model ${choice.label}` : `offline (fallback: ${choice.label} was not usable)` };
+  } finally {
+    await loaded.backend.dispose?.();
+  }
+}
+
 async function runFree(mode: Mode, o: RunOptions, outPath: string): Promise<number> {
   if (o.llmUrl && !isLocalUrl(o.llmUrl) && !o.allowRemoteLlm) {
     console.error(`Refusing to send project details to ${o.llmUrl}: it isn't on this computer. Add --allow-remote-llm if you trust that server.`);
@@ -208,11 +247,17 @@ async function runFree(mode: Mode, o: RunOptions, outPath: string): Promise<numb
   const findings = runRules(facts);
   let report: string;
   let engineLabel = "offline (free, no AI)";
+  // auto never downloads: it uses the embedded model only if a runtime and a model are already installed.
+  const embeddedReady = () => { try { return Boolean(findRuntime() && chooseModel({ file: o.modelFile, id: o.embeddedModel })); } catch { return false; } };
   if (o.engine === "offline") {
     report = renderReport(facts, findings, o.note);
+  } else if (o.engine === "embedded" || (o.engine === "auto" && (o.modelFile || o.embeddedModel))) {
+    ({ report, engineLabel } = await runEmbedded(mode, o, facts, findings));
   } else {
     const m = await detectLocalModel({ url: o.llmUrl, model: o.localModel });
-    if (!m) {
+    if (!m && o.engine === "auto" && embeddedReady()) {
+      ({ report, engineLabel } = await runEmbedded(mode, o, facts, findings));
+    } else if (!m) {
       const hint = o.localModel
         ? `Model "${o.localModel}" not found on ${o.llmUrl ?? "Ollama (localhost:11434) or LM Studio (localhost:1234)"}.`
         : `No local model server found${o.llmUrl ? ` at ${o.llmUrl}` : " (looked for Ollama on localhost:11434 and LM Studio on localhost:1234)"}.`;
@@ -224,9 +269,9 @@ async function runFree(mode: Mode, o: RunOptions, outPath: string): Promise<numb
       report = renderReport(facts, findings, o.note);
     } else {
       process.stderr.write(`🛟 UNSTUCK ${VERSION} · ${mode} · engine: local model ${m.model} · ${o.repo}\n`);
-      const r = await localDiagnosis(m, facts, findings, o.note, o.lang, o.quiet ? undefined : log);
+      const r = await diagnoseWith(httpBackend(m), facts, findings, o.note, o.lang, o.quiet ? undefined : log);
       report = r.report;
-      engineLabel = r.usedModel ? `local model ${m.model}` : "offline (local model answer not usable)";
+      engineLabel = r.usedModel ? `local model ${m.model}` : `offline (fallback: ${m.model} was not usable)`;
     }
   }
   if (engineLabel.startsWith("offline")) {
@@ -257,7 +302,9 @@ const common = (c: Command, defaultTeam: boolean) =>
     .argument("[path]", "project folder", ".")
     .option("-o, --out <file>", "where to save the report (must be outside the project; default ~/.unstuck/reports/…)")
     .option("--run-checks", "allow running the project's tests, build and lint (they can execute code and write files)")
-    .addOption(new Option("-e, --engine <engine>", "auto: Claude if ANTHROPIC_API_KEY is set, else a local model if running, else offline").choices(["auto", "offline", "local", "claude"]).default("auto"))
+    .addOption(new Option("-e, --engine <engine>", "auto: Claude if ANTHROPIC_API_KEY is set, else a running local model server, else an installed embedded model, else offline").choices(["auto", "offline", "local", "embedded", "claude"]).default("auto"))
+    .option("--model-file <path>", "run this GGUF model file with the embedded engine")
+    .option("--embedded-model <id>", "embedded model to use (see `unstuck model list`)")
     .option("--note <text>", "what feels stuck, in your words")
     .option("--local-model <name>", "local model to use, e.g. qwen2.5-coder:7b (default: best installed)")
     .option("--llm-url <url>", "local model server, e.g. http://localhost:11434 (Ollama) or http://localhost:1234 (LM Studio)")
@@ -286,6 +333,8 @@ const opts = (p: string, c: Record<string, string | boolean | undefined>, defaul
   localModel: c.localModel as string | undefined,
   allowRemoteLlm: Boolean(c.allowRemoteLlm),
   note: c.note as string | undefined,
+  modelFile: c.modelFile as string | undefined,
+  embeddedModel: c.embeddedModel as string | undefined,
 });
 
 const done = (code: number) => { process.exitCode = code; };
@@ -345,6 +394,84 @@ program
       copyFileSync(path.join(ROOT, "templates", "GUARDIAN.md"), target);
       console.log(`Created ${target}. Fill in your rules and locked files, then run \`unstuck review\`.`);
     }
+  });
+
+// ---- unstuck model … : the only commands that download anything, and only after consent ----
+const modelCmd = program.command("model").description("manage the optional embedded open-source AI model (nothing is downloaded without your consent)");
+
+modelCmd.command("list").description("show available and installed models").action(() => {
+  const installed = installedModels();
+  console.log(`Embedded AI runtime: ${findRuntime() ? `installed (${findRuntime()})` : "not installed — `unstuck model runtime`"}`);
+  console.log(`Models folder: ${modelDir()}\n`);
+  for (const m of CATALOG) {
+    const inst = installed.find((i) => i.id === m.id);
+    console.log(`${inst ? "●" : "○"} ${m.id}${m.default ? " (default)" : ""}\n    ${m.name} · about ${formatBytes(m.approxBytes)} · ${m.license} · needs ~${m.minRamGB} GB RAM\n    ${m.note}${inst ? `\n    installed: ${inst.file}` : ""}`);
+  }
+});
+
+modelCmd.command("download").description("download a model (asks first)").argument("[id]", "model id from `unstuck model list`")
+  .option("-y, --yes", "agree to the download without asking")
+  .option("--allow-unverified", "download even if the source publishes no checksum")
+  .action(async (id: string | undefined, c) => {
+    const m = id ? catalogModel(id) : defaultModel();
+    if (!m) { console.error(`Unknown model "${id}". Run \`unstuck model list\`.`); return done(2); }
+    let info;
+    try { info = await remoteInfo(sourceUrl(m)); } catch (err) { console.error(`Could not reach the model source: ${(err as Error).message}`); return done(1); }
+    const dest = path.join(modelDir(), m.file);
+    process.stderr.write(consentText(m, info, dest) + "\n\n");
+    if (!(await askConsent({ yes: c.yes }))) {
+      console.error(process.stdin.isTTY ? "Not downloaded." : "Not downloaded: no terminal to ask for consent. Re-run with --yes to agree.");
+      return done(c.yes ? 0 : 3);
+    }
+    try {
+      let last = 0;
+      const r = await downloadModel(m, info, {
+        allowUnverified: c.allowUnverified,
+        progress: (d, t) => { const now = Date.now(); if (now - last > 1000 && process.stderr.isTTY) { last = now; process.stderr.write(`\r  ${formatBytes(d)}${t ? ` of ${formatBytes(t)} (${Math.floor((d / t) * 100)}%)` : ""}   `); } },
+      });
+      process.stderr.write(`\nSaved ${formatBytes(r.bytes)} to ${r.file}${r.verified ? " · SHA-256 verified" : " · not verified (no checksum published)"}\n`);
+      if (!findRuntime()) process.stderr.write("Next: `unstuck model runtime` installs the engine that runs it (also asks first).\n");
+    } catch (err) {
+      console.error(`Download failed: ${(err as Error).message}`);
+      return done(1);
+    }
+  });
+
+modelCmd.command("remove").description("delete a downloaded model").argument("<id>", "model id").option("-y, --yes", "don't ask")
+  .action(async (id: string, c) => {
+    const inst = installedModels().find((i) => i.id === id);
+    if (!inst) { console.error(`Model "${id}" isn't installed.`); return done(2); }
+    process.stderr.write(`Delete ${inst.file} (${formatBytes(inst.bytes)})?\n`);
+    if (!(await askConsent({ yes: c.yes }))) { console.error("Not deleted."); return done(c.yes ? 0 : 3); }
+    rmSync(inst.file, { force: true }); rmSync(sidecarPath(inst.file), { force: true });
+    console.log(`Deleted ${inst.file}`);
+  });
+
+modelCmd.command("runtime").description("install the engine that runs embedded models (asks first)").option("-y, --yes", "agree without asking")
+  .action(async (c) => {
+    const pkg = platformPackage();
+    if (!pkg) { console.error(`No prebuilt embedded runtime for ${process.platform}-${process.arch}. The offline engine still works.`); return done(2); }
+    const dir = runtimeDir();
+    process.stderr.write([
+      "UNSTUCK would like to install the embedded AI runtime so models can run inside UNSTUCK.",
+      "",
+      `  Packages:   node-llama-cpp@${RUNTIME_VERSION} and ${pkg}@${RUNTIME_VERSION} (prebuilt llama.cpp)`,
+      "  Source:     the npm registry (https://registry.npmjs.org)",
+      "  License:    MIT",
+      "  Size:       about 90 MB",
+      `  Saved to:   ${dir}`,
+      "",
+      "Nothing is compiled or downloaded later: the runtime is loaded with building and downloading turned off.",
+      "",
+    ].join("\n"));
+    if (!(await askConsent({ yes: c.yes }))) { console.error(process.stdin.isTTY ? "Not installed." : "Not installed: no terminal to ask for consent. Re-run with --yes to agree."); return done(c.yes ? 0 : 3); }
+    mkdirSync(dir, { recursive: true });
+    const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+    const r = spawnSync(npm, ["install", "--prefix", dir, "--omit=optional", "--no-audit", "--no-fund", "--no-save", `node-llama-cpp@${RUNTIME_VERSION}`, `${pkg}@${RUNTIME_VERSION}`], {
+      stdio: "inherit", env: { ...process.env, NODE_LLAMA_CPP_SKIP_DOWNLOAD: "true" }, shell: process.platform === "win32",
+    });
+    if (r.status !== 0) { console.error("Runtime install failed. The offline engine still works."); return done(1); }
+    console.log(`Installed the embedded AI runtime in ${dir}`);
   });
 
 program.parseAsync();

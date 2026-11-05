@@ -19,10 +19,23 @@ No API key, no subscription, nothing leaves your computer.
 | Engine | Cost | Needs | What you get |
 |--------|------|-------|--------------|
 | **Offline** (always available) | Free | Nothing | Rule-based checks of your files and git history: fix/revert loops, competing "v2" copies, missing tests, leaked secrets, packages that aren't installed, instructions planted for AI tools, and more. |
-| **Local open-source model** | Free | [Ollama](https://ollama.com) or [LM Studio](https://lmstudio.ai), ~8–16 GB RAM | The offline checks, plus an open model (Qwen Coder, Llama, DeepSeek, Gemma…) running on your computer reads the evidence and the key code and writes a sharper diagnosis. |
+| **Embedded open-source model** (preview) | Free | A one-time, consented download; 4–16 GB RAM | Same as below, but the model runs inside UNSTUCK itself: no Ollama, no server, no account. |
+| **Local open-source model server** | Free | [Ollama](https://ollama.com) or [LM Studio](https://lmstudio.ai), ~8–16 GB RAM | The offline checks, plus an open model (Qwen Coder, Llama, DeepSeek, Gemma…) running on your computer reads the evidence and the key code and writes a sharper diagnosis. |
 | **Claude** (optional) | Pay per use | `ANTHROPIC_API_KEY` | The full five-specialist team described below, which can also run your tests and apply fixes. |
 
-UNSTUCK picks automatically: Claude if you've set a key, otherwise a local model if one is running, otherwise offline. Force one with `--engine offline|local|claude`.
+UNSTUCK picks automatically: Claude if you've set a key, otherwise a running local model server, otherwise an embedded model you've already downloaded, otherwise offline. It never downloads anything on its own. Force one with `--engine offline|embedded|local|claude`.
+
+### Embedded model (preview)
+
+```bash
+unstuck model runtime          # installs the engine that runs models (~90 MB from npm) — asks first
+unstuck model download         # Qwen2.5-Coder 1.5B, ~1.1 GB from Hugging Face — asks first
+unstuck rescue --engine embedded
+```
+
+Before anything is downloaded UNSTUCK shows the model's name, exact size, source, license, SHA-256 and where it will be saved, and waits for a yes (or `--yes`). Downloads are verified against the checksum the source publishes. `unstuck model list` shows what's installed; `unstuck model remove <id>` deletes it. You can also run any GGUF file you already have with `--model-file path/to/model.gguf`.
+
+The embedded engine runs with downloading and compiling switched off, never contacts the network, and uses the same safeguards as a local model server (below). If the model can't load or gives an unusable answer, you get the offline diagnosis with a clear notice at the top saying so.
 
 ### Use a free local model
 

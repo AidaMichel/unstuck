@@ -11,6 +11,27 @@ import { redact } from "./report.js";
 
 export interface LocalModel { kind: "ollama" | "openai"; base: string; model: string }
 
+/**
+ * Anything that can answer a prompt: a local HTTP model server or the embedded in-process model.
+ * The diagnosis pipeline (facts → prompt → answer check → fallback) is shared by all of them.
+ */
+export interface ModelBackend {
+  /** Model name for the report, e.g. "qwen2.5-coder:7b". */
+  model: string;
+  /** Human label for the engine, e.g. "Ollama" or "embedded model". */
+  engine: string;
+  /** Where it runs, for the report footer. */
+  where: string;
+  /** Context window in tokens, if known; the prompt is fitted to it. */
+  contextTokens?: number;
+  /** Exact token count, if the backend can tokenize; otherwise ~4 characters per token is assumed. */
+  countTokens?: (text: string) => number;
+  ask(system: string, user: string, maxAnswerTokens: number): Promise<string>;
+  dispose?(): Promise<void>;
+}
+
+export const ANSWER_TOKENS = 900;
+
 const PREFERRED = [/qwen2\.5-coder/i, /qwen3-coder/i, /qwen3/i, /deepseek-coder/i, /deepseek-r1/i, /codestral/i, /llama3\.[1-9]/i, /gemma[23]/i, /mistral/i, /phi[34]/i];
 const HEADINGS = ["Goal", "Reality", "Evidence", "Verified Problems", "Hypotheses", "One Recommended Next Move"];
 const MAX_EXCERPT_FILE = 6_000;
@@ -54,7 +75,7 @@ export async function detectLocalModel(opts: { url?: string; model?: string } = 
 }
 
 /** Pick the code most likely to matter and number its lines so the model can cite file:line. */
-export function codeExcerpts(f: Facts, findings: Finding[]): { file: string; text: string }[] {
+export function codeExcerpts(f: Facts, findings: Finding[], maxChars = MAX_EXCERPTS): { file: string; text: string }[] {
   const wanted: string[] = [];
   const push = (p?: string) => { if (p && !wanted.includes(p) && !SECRET_FILE.test(p)) wanted.push(p); };
   for (const x of findings) for (const e of x.evidence) push(e.match(/^([\w./@-]+\.[a-z]+)(?::\d+)?\s—/i)?.[1]);
@@ -77,7 +98,7 @@ export function codeExcerpts(f: Facts, findings: Finding[]): { file: string; tex
       let text = redact(readFileSync(full, "utf8"));
       if (text.length > MAX_EXCERPT_FILE) text = text.slice(0, MAX_EXCERPT_FILE) + "\n… (truncated)";
       const numbered = text.split("\n").map((l, i) => `${String(i + 1).padStart(4)}| ${l}`).join("\n");
-      if (total + numbered.length > MAX_EXCERPTS) continue; // try smaller files
+      if (total + numbered.length > maxChars) continue; // try smaller files
       total += numbered.length;
       out.push({ file: rel, text: numbered });
     } catch { /* skip */ }
@@ -85,7 +106,9 @@ export function codeExcerpts(f: Facts, findings: Finding[]): { file: string; tex
   return out;
 }
 
-export function buildPrompt(f: Facts, findings: Finding[], userNote?: string, lang?: string): { system: string; user: string } {
+export interface PromptBudget { maxExcerptChars?: number; compact?: boolean }
+
+export function buildPrompt(f: Facts, findings: Finding[], userNote?: string, lang?: string, budget: PromptBudget = {}): { system: string; user: string } {
   const system = `You are UNSTUCK, a careful senior engineer diagnosing a stuck software project for a reader who may not be a programmer.
 
 Rules:
@@ -102,13 +125,13 @@ Rules:
     user_says_stuck: userNote || null,
     stack: f.stack,
     reality: { source_files: f.files.source.length, test_files: f.files.tests, git: gitLine(f) },
-    recent_commits: f.git.commits.slice(0, 15).map((c) => `${c.hash} ${c.date} "${c.subject}" [${c.files.slice(0, 5).join(", ")}]`),
-    uncommitted: [...f.git.modified, ...f.git.untracked.map((u) => `${u} (untracked)`)].slice(0, 20),
+    recent_commits: f.git.commits.slice(0, budget.compact ? 5 : 15).map((c) => `${c.hash} ${c.date} "${c.subject}" [${c.files.slice(0, 5).join(", ")}]`),
+    uncommitted: [...f.git.modified, ...f.git.untracked.map((u) => `${u} (untracked)`)].slice(0, budget.compact ? 5 : 20),
     package_scripts: f.manifest?.scripts ?? null,
-    rule_findings: findings.map((x) => ({ id: x.id, severity: x.severity, verified: x.verified, title: x.title, evidence: x.evidence, next: x.next })),
+    rule_findings: findings.map((x) => ({ id: x.id, severity: x.severity, verified: x.verified, title: x.title, evidence: x.evidence.slice(0, budget.compact ? 2 : 6), next: x.next })),
   };
-  const code = codeExcerpts(f, findings).map((c) => `--- ${c.file} ---\n${c.text}`).join("\n\n");
-  const user = `FACTS (collected by code, read-only):\n${redact(JSON.stringify(facts, null, 2))}\n\nCODE EXCERPTS (line-numbered):\n${code || "(none)"}\n\nWrite the diagnosis now.`;
+  const code = codeExcerpts(f, findings, budget.maxExcerptChars).map((c) => `--- ${c.file} ---\n${c.text}`).join("\n\n");
+  const user = `FACTS (collected by code, read-only):\n${redact(JSON.stringify(facts, budget.compact ? undefined : null, budget.compact ? 0 : 2))}\n\nCODE EXCERPTS (line-numbered):\n${code || "(none)"}\n\nWrite the diagnosis now.`;
   return { system, user };
 }
 
@@ -123,7 +146,7 @@ export function checkAnswer(text: string, f: Facts): { ok: boolean; problems: st
     else pos = i;
   }
   for (const m of text.matchAll(/([\w./@-]+\.[a-z]{1,5}):(\d+)/gi)) {
-    const [, file, line] = m;
+    const file = m[1].replace(/^\.\//, ""), line = m[2];
     const n = f.files.lines[file];
     if (n === undefined && !Object.keys(f.files.lines).some((k) => k.endsWith("/" + file))) {
       if (/\.(m?[jt]sx?|py|go|rb|rs|java|kt|swift|php|cs|vue|svelte)$/.test(file)) problems.push(`cites unknown file ${file}`);
@@ -161,35 +184,82 @@ export function cleanAnswer(text: string): string {
   return (i > 0 ? t.slice(i) : t).trim();
 }
 
-export async function localDiagnosis(
-  m: LocalModel, f: Facts, findings: Finding[], userNote?: string, lang?: string,
+/** Wrap a running HTTP model server (Ollama, LM Studio, …) as a backend. */
+export function httpBackend(m: LocalModel): ModelBackend {
+  return {
+    model: m.model,
+    engine: m.kind === "ollama" ? "Ollama" : "OpenAI-compatible server",
+    where: isLocalUrl(m.base) ? "on this computer" : `at ${new URL(m.base).host}`,
+    contextTokens: m.kind === "ollama" ? 16384 : undefined,
+    ask: (system, user) => askLocalModel(m, system, user),
+  };
+}
+
+const approxTokens = (s: string) => Math.ceil(s.length / 3.5);
+
+/**
+ * Build the prompt, shrinking it until it fits the backend's context window
+ * (with room for the answer). Returns null if even the smallest prompt doesn't fit.
+ */
+export function fitPrompt(
+  b: Pick<ModelBackend, "contextTokens" | "countTokens">, f: Facts, findings: Finding[], userNote?: string, lang?: string,
+): { system: string; user: string; tokens: number; excerptChars: number } | null {
+  const count = b.countTokens ?? approxTokens;
+  const limit = b.contextTokens ? b.contextTokens - ANSWER_TOKENS - 64 : Infinity;
+  const steps: PromptBudget[] = [
+    { maxExcerptChars: MAX_EXCERPTS }, { maxExcerptChars: 10_000 }, { maxExcerptChars: 5_000 },
+    { maxExcerptChars: 2_500, compact: true }, { maxExcerptChars: 1_000, compact: true }, { maxExcerptChars: 0, compact: true },
+  ];
+  for (const step of steps) {
+    const p = buildPrompt(f, findings, userNote, lang, step);
+    const tokens = count(p.system) + count(p.user);
+    if (tokens <= limit) return { ...p, tokens, excerptChars: step.maxExcerptChars ?? 0 };
+  }
+  return null;
+}
+
+export interface Diagnosis { report: string; usedModel: boolean; failure?: string }
+
+/** The one diagnosis pipeline for every AI backend. Any failure gives a clearly labelled offline report. */
+export async function diagnoseWith(
+  b: ModelBackend, f: Facts, findings: Finding[], userNote?: string, lang?: string,
   log: (s: string) => void = () => {},
-): Promise<{ report: string; usedModel: boolean }> {
-  const { system, user } = buildPrompt(f, findings, userNote, lang);
-  const where = isLocalUrl(m.base) ? "on this computer" : `at ${new URL(m.base).host}`;
+): Promise<Diagnosis> {
   const ruleList = findings.length
     ? findings.map((x) => `- ${x.id} · ${x.severity} · ${x.verified ? "verified" : "hypothesis"} · ${x.title}`).join("\n")
     : "- none";
+  const fallback = (failure: string): Diagnosis => ({
+    usedModel: false,
+    failure,
+    report: renderReport(f, findings, userNote,
+      `The ${b.engine} (${b.model}) could not produce a usable diagnosis: ${failure}. This is UNSTUCK's free offline diagnosis instead.`),
+  });
+  const prompt = fitPrompt(b, f, findings, userNote, lang);
+  if (!prompt) return fallback(`the project facts don't fit in the model's ${b.contextTokens}-token context window`);
+  if (prompt.excerptChars < MAX_EXCERPTS) log(`prompt shortened to fit the model's context (${prompt.tokens} tokens, ${prompt.excerptChars} characters of code)`);
   try {
-    log(`asking ${m.model} (${m.kind === "ollama" ? "Ollama" : "OpenAI-compatible server"} ${where})…`);
-    const answer = cleanAnswer(redact(await askLocalModel(m, system, user)));
+    log(`asking ${b.model} (${b.engine} ${b.where})…`);
+    const answer = cleanAnswer(redact(await b.ask(prompt.system, prompt.user, ANSWER_TOKENS)));
     const check = checkAnswer(answer, f);
     if (!check.ok) {
       log(`model answer rejected: ${check.problems.join("; ")}`);
-      return {
-        usedModel: false,
-        report: renderReport(f, findings, userNote).replace(
-          "_Diagnosed by UNSTUCK's free offline engine",
-          `_The local model's answer failed UNSTUCK's checks (${check.problems.slice(0, 3).join("; ")}), so this is the free offline engine's report instead. Diagnosed by UNSTUCK's free offline engine`,
-        ),
-      };
+      return fallback(`its answer failed UNSTUCK's checks (${check.problems.slice(0, 3).join("; ")})`);
     }
     return {
       usedModel: true,
-      report: `${answer}\n\n<details><summary>Rule-based checks (always run, no AI)</summary>\n\n${ruleList}\n\n</details>\n\n---\n_Diagnosed by UNSTUCK with the open model **${m.model}** running ${where}. The model only saw facts and code excerpts collected by UNSTUCK; it could not run commands or change files. Nothing was changed._\n${summaryLine(findings)}`,
+      report: `${answer}\n\n<details><summary>Rule-based checks (always run, no AI)</summary>\n\n${ruleList}\n\n</details>\n\n---\n_Diagnosed by UNSTUCK with the open model **${b.model}** (${b.engine}) running ${b.where}. The model only saw facts and code excerpts collected by UNSTUCK; it could not run commands or change files. Nothing was changed._\n${summaryLine(findings)}`,
     };
   } catch (err) {
-    log(`local model failed: ${(err as Error).message}`);
-    return { usedModel: false, report: renderReport(f, findings, userNote) };
+    const msg = (err as Error).message.split("\n")[0].slice(0, 200);
+    log(`model failed: ${msg}`);
+    return fallback(`it failed while answering (${msg})`);
   }
+}
+
+/** Backwards-compatible wrapper for HTTP model servers. */
+export async function localDiagnosis(
+  m: LocalModel, f: Facts, findings: Finding[], userNote?: string, lang?: string,
+  log: (s: string) => void = () => {},
+): Promise<Diagnosis> {
+  return diagnoseWith(httpBackend(m), f, findings, userNote, lang, log);
 }

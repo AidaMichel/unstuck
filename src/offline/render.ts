@@ -26,10 +26,12 @@ export function summaryLine(findings: Finding[]): string {
   return `<!-- unstuck:summary P0=${c.P0} P1=${c.P1} P2=${c.P2} P3=${c.P3} -->`;
 }
 
-export function renderReport(f: Facts, findings: Finding[], userNote?: string): string {
+export function renderReport(f: Facts, findings: Finding[], userNote?: string, notice?: string): string {
   const verified = findings.filter((x) => x.verified);
   const hyps = findings.filter((x) => !x.verified);
   const out: string[] = [];
+  // A notice (e.g. why an AI engine wasn't used) goes first so nobody mistakes this for the AI's answer.
+  if (notice) out.push(`> ⚠️ **${notice}**\n`);
 
   out.push("### Goal");
   out.push(f.intent ? `${f.intent.text} _(${f.intent.source})_` : "Not stated anywhere in the project (no README summary, GUARDIAN.md or package.json description).");
